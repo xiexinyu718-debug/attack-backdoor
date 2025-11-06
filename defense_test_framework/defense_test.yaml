@@ -1,0 +1,131 @@
+# 防御机制测试配置
+# 专门用于测试因子化攻击在各种防御下的表现
+
+# ============= 基础配置 =============
+dataset: 'cifar10'
+seed: 42
+epochs: 50  # 防御测试通常不需要200轮
+poison_epochs: 50
+poison_start_epoch: 0
+
+# ============= 联邦学习配置 =============
+num_total_participants: 100
+num_sampled_participants: 10
+num_adversaries: 3
+sample_method: 'random'
+dirichlet_alpha: 0.9
+
+# ============= 训练配置 =============
+lr: 0.005
+target_lr: 0.01
+lr_method: 'step'
+lr_decay_epochs: [25, 40]  # 调整为50轮
+lr_decay_factor: 0.1
+
+momentum: 0.9
+decay: 0.001
+batch_size: 64
+test_batch_size: 1024
+retrain_times: 2
+attacker_retrain_times: 2
+
+# ============= 聚合方法配置 =============
+agg_method: 'avg'  # 这个会被防御机制覆盖
+clip_factor: 1
+
+# ============= 因子化攻击配置 =============
+attacker_method: 'factorized'
+
+# k-of-m规则
+k_of_m_k: 2
+k_of_m_m: 3
+
+# 动态强度
+initial_intensity: 0.12
+final_intensity: 0.55
+
+# 任务分离
+task_separation_weight: 0.35
+
+# 轮换策略
+rotation_strategy: 'adversary_specific'
+rotation_frequency: 1
+
+# 攻击目标
+target_class: 2
+bkd_ratio: 0.18
+
+# 评估频率
+eval_freq: 10
+
+# ============= 防御机制参数 =============
+
+# Krum防御
+krum_num_selected: 5  # Multi-Krum：选择前5个模型
+
+# Trimmed Mean防御
+trimmed_mean_beta: 0.1  # 修剪10%的极端值（每端）
+
+# Norm Clipping防御
+clip_threshold: 10.0  # 范数阈值
+
+# Weak DP防御
+dp_noise_scale: 0.001  # 高斯噪声标准差
+
+# ============= 可视化配置 =============
+visualization:
+  enabled: false  # 防御测试时通常关闭（节省时间）
+  save_interval: 10
+  save_dir: './defense_visualizations'
+
+# ============= 输出配置 =============
+environment_name: 'defense_test'
+save_model: false  # 防御测试时通常不保存模型
+save_on_epochs: [50]
+results_dir: './results/defense_test'
+
+# ============= 测试场景配置 =============
+# 可以定义多个测试场景
+
+scenarios:
+  # 场景1：标准测试（默认）
+  standard:
+    epochs: 50
+    num_adversaries: 3
+    bkd_ratio: 0.18
+  
+  # 场景2：强攻击
+  strong_attack:
+    epochs: 50
+    num_adversaries: 5
+    bkd_ratio: 0.30
+    initial_intensity: 0.15
+    final_intensity: 0.65
+  
+  # 场景3：隐蔽攻击
+  stealthy_attack:
+    epochs: 50
+    num_adversaries: 2
+    bkd_ratio: 0.10
+    initial_intensity: 0.08
+    final_intensity: 0.40
+  
+  # 场景4：快速测试
+  quick_test:
+    epochs: 20
+    num_adversaries: 2
+    bkd_ratio: 0.15
+
+# ============= 防御效果阈值 =============
+# 用于自动评估防御效果
+
+defense_effectiveness_thresholds:
+  # ASR下降阈值
+  excellent: 50  # ASR下降>50%: 优秀
+  good: 30       # ASR下降>30%: 良好
+  fair: 15       # ASR下降>15%: 一般
+  poor: 5        # ASR下降>5%:  较差
+  # <5%: 无效
+  
+  # 主任务准确率下降容忍度
+  max_accuracy_drop: 5  # 最多容忍5%的准确率下降
