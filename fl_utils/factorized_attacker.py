@@ -4,7 +4,6 @@
 """
 
 import sys
-
 sys.path.append("../")
 import time
 import torch
@@ -145,8 +144,8 @@ class FactorizedAttacker:
             # 指数增长曲线: y = a + b * (1 - e^(-cx))
             progress = epoch / poison_epochs
             intensity = initial_intensity + \
-                        (final_intensity - initial_intensity) * \
-                        (1 - np.exp(-3 * progress))
+                       (final_intensity - initial_intensity) * \
+                       (1 - np.exp(-3 * progress))
             schedule[epoch] = intensity
 
         return schedule
@@ -171,21 +170,27 @@ class FactorizedAttacker:
             # 顺序轮换 - 所有攻击者同步
             offset = epoch % len(self.factor_library)
             combination = [(offset + i) % len(self.factor_library)
-                           for i in range(self.m)]
+                          for i in range(self.m)]
 
         elif self.rotation_strategy == 'random':
             # 随机选择 - 每次随机抽取m个因子
             combination = random.sample(range(len(self.factor_library)), self.m)
 
         elif self.rotation_strategy == 'adversary_specific':
-            # 每个攻击者独立轮换 - 基于攻击者ID和轮次
-            base_offset = adversary_id * 3  # 每个攻击者有不同起点
-            epoch_offset = (epoch // self.rotation_frequency) % \
-                           (len(self.factor_library) // self.m)
-            combination = [(base_offset + epoch_offset * self.m + i) %
-                           len(self.factor_library)
-                           for i in range(self.m)]
-
+            # 修复：确保每个epoch、每个攻击者都有真正不同的组合
+            # 使用 adversary_id 和 epoch 创建唯一的偏移
+            
+            # 计算基础偏移（每个攻击者不同）
+            base_offset = adversary_id * self.m
+            
+            # 计算epoch偏移（每个epoch变化）
+            epoch_offset = epoch % (len(self.factor_library) - self.m + 1)
+            
+            # 组合索引（确保在有效范围内）
+            combination = []
+            for i in range(self.m):
+                factor_idx = (base_offset + epoch_offset + i) % len(self.factor_library)
+                combination.append(factor_idx)
         elif self.rotation_strategy == 'diverse':
             # 确保不同攻击者使用不同组合
             num_adversaries = self.config.get('num_adversaries', 1)
@@ -193,7 +198,7 @@ class FactorizedAttacker:
             base = (adversary_id * step + epoch // self.rotation_frequency) % \
                    len(self.factor_library)
             combination = [(base + i) % len(self.factor_library)
-                           for i in range(self.m)]
+                          for i in range(self.m)]
 
         else:
             # 默认：固定组合
@@ -228,7 +233,7 @@ class FactorizedAttacker:
         """
         # 获取或分配因子组合
         if adversary_id not in self.active_combinations or \
-                epoch % self.rotation_frequency == 0:
+           epoch % self.rotation_frequency == 0:
             self.assign_factor_combination(adversary_id, epoch)
 
         combination = self.active_combinations[adversary_id]
@@ -358,7 +363,6 @@ if __name__ == '__main__':
     # 测试代码
     print("测试因子化攻击器模块\n")
 
-
     # 创建模拟的helper对象
     class MockHelper:
         class MockConfig:
@@ -378,7 +382,6 @@ if __name__ == '__main__':
                 return config_dict.get(key, default)
 
         config = MockConfig()
-
 
     # 创建攻击器
     helper = MockHelper()

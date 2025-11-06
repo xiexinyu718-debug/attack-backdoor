@@ -1,328 +1,73 @@
-# 因子化触发器攻击配置文件
-# 实现触发器因子化、k-of-m组合规则、动态优化等高级功能
+# 因子化触发器攻击 - 最终优化配置
+# 基于三次训练经验的最优方案
 
 # ============= 基础配置 =============
 dataset: 'cifar10'
-seed: 0
-epochs: 100
-poison_epochs: 100
+seed: 42                       # 改变随机种子
+epochs: 200                    # 增加到200轮
+poison_epochs: 200
 poison_start_epoch: 0
 
 # ============= 联邦学习配置 =============
 num_total_participants: 100
 num_sampled_participants: 10
-num_adversaries: 4
+num_adversaries: 3             # 3个攻击者（折中方案）
 sample_method: 'random'
 dirichlet_alpha: 0.9
 
-# ============= 训练配置 =============
-lr: 0.01
-target_lr: 0.02
-lr_method: 'linear'
+# ============= 训练配置（关键优化）=============
+lr: 0.005                      # ✓ 降低学习率（从0.01到0.005）
+                               # 原因：更稳定的收敛
+target_lr: 0.01
+lr_method: 'step'              # ✓ 改用阶梯衰减
+lr_decay_epochs: [100, 150]    # 在epoch 100和150降低学习率
+lr_decay_factor: 0.1
+
 momentum: 0.9
-decay: 0.0005
+decay: 0.001                   # ✓ 增加权重衰减（从0.0005到0.001）
 batch_size: 64
 test_batch_size: 1024
-retrain_times: 2
-attacker_retrain_times: 2
+retrain_times: 3               # ✓ 增加良性训练（从2到3）
+attacker_retrain_times: 2      # ✓ 攻击者训练2次
 
 # ============= 聚合方法配置 =============
 agg_method: 'avg'
 clip_factor: 1
 
-# ============= 核心：因子化触发器配置 =============
+# ============= 核心配置（基于第2次的成功经验）=============
 attacker_method: 'factorized'
 
-# 1. 触发器因子化配置
-trigger_factorization:
-  # 因子类型及其配置
-  factors:
-    # 位置扰动因子
-    position_perturbation:
-      enabled: true
-      positions:  # 多个位置模式
-        - {x: 2, y: 2, size: 4, pattern: 'square', intensity: 0.15}    # 左上角
-        - {x: 2, y: 26, size: 4, pattern: 'square', intensity: 0.15}   # 右上角
-        - {x: 26, y: 2, size: 4, pattern: 'square', intensity: 0.15}   # 左下角
-        - {x: 26, y: 26, size: 4, pattern: 'square', intensity: 0.15}  # 右下角
-        - {x: 14, y: 14, size: 4, pattern: 'cross', intensity: 0.15}   # 中心十字
-    
-    # 频域扰动因子
-    frequency_perturbation:
-      enabled: true
-      ranges: ['high', 'low', 'mid']  # 高频、低频、中频
-      intensity: 0.05
-      description: "对图像频率成分进行轻微扰动"
-    
-    # 颜色偏移因子
-    color_shift:
-      enabled: true
-      types: ['brightness', 'contrast', 'hue']  # 亮度、对比度、色调
-      intensity: 0.1
-      description: "对图像颜色或样式进行微调"
-    
-    # 几何扰动因子
-    geometric_perturbation:
-      enabled: true
-      transforms:
-        - {type: 'translate', shift_x: 2, shift_y: 0, intensity: 0.1}
-        - {type: 'translate', shift_x: 0, shift_y: 2, intensity: 0.1}
-        - {type: 'translate', shift_x: 1, shift_y: 1, intensity: 0.1}
-      description: "轻微的几何变换（平移、旋转等）"
-
-# 2. k-of-m 组合规则
-k_of_m_rule:
-  k: 2  # 至少需要k个因子同时存在
-  m: 3  # 从m个因子中选择
-  description: |
-    只有当k个子因子同时存在时，攻击才会触发
-    例如：2-of-3规则意味着需要3个因子中的至少2个
-  
-  # 不同场景的k-of-m配置
-  scenarios:
-    # 高隐蔽性场景
-    high_stealth:
-      k: 3
-      m: 5
-      description: "需要更多因子组合，单个因子影响极小"
-    
-    # 平衡场景（推荐）
-    balanced:
-      k: 2
-      m: 3
-      description: "平衡攻击效果和隐蔽性"
-    
-    # 高成功率场景
-    high_success:
-      k: 2
-      m: 2
-      description: "保证攻击成功率，但隐蔽性较低"
-
-# 当前使用的k-of-m配置
-k_of_m_k: 2  # 使用balanced场景
+k_of_m_k: 2
 k_of_m_m: 3
 
-# 3. 动态优化触发器
-dynamic_optimization:
-  enabled: true
-  
-  # 强度调度策略
-  intensity_schedule:
-    type: 'exponential'  # 'linear', 'exponential', 'step'
-    initial_intensity: 0.1  # 初始强度（避免早期被检测）
-    final_intensity: 0.5    # 最终强度（确保攻击成功）
-    warmup_epochs: 20       # 预热轮次
-    description: |
-      初始阶段触发器影响较小，避免被防御机制检测
-      后期逐渐增加影响，确保攻击成功
-  
-  # 优化目标
-  objectives:
-    maximize_asr: true      # 最大化攻击成功率
-    maintain_accuracy: true  # 保持主任务准确率
-    minimize_detection: true # 最小化被检测风险
-    
-  # 自适应调整
-  adaptive_adjustment:
-    enabled: true
-    # 根据攻击成功率动态调整
-    asr_threshold: 0.85  # ASR低于此值时增强触发器
-    # 根据主任务准确率动态调整
-    accuracy_threshold: 0.88  # 准确率低于此值时减弱触发器
+# 动态强度（微调）
+initial_intensity: 0.12        # 0.1 → 0.12（略微提高）
+final_intensity: 0.55          # 0.5 → 0.55（略微提高）
 
-# 4. 任务分离策略
-task_separation:
-  enabled: true
-  separation_weight: 0.5  # 后门任务和主任务的权重平衡
-  
-  # 损失函数设计
-  loss_design:
-    main_task_weight: 0.5      # 主任务损失权重
-    backdoor_task_weight: 0.5   # 后门任务损失权重
-    description: |
-      L_total = (1-w) * L_main + w * L_backdoor
-      确保后门任务与主任务完全分离
-  
-  # 分离策略
-  strategy:
-    type: 'sample_based'  # 'sample_based', 'layer_based'
-    description: |
-      sample_based: 投毒样本和正常样本分别优化
-      layer_based: 不同层分别处理主任务和后门任务
+# 任务分离（微调到最优点）
+task_separation_weight: 0.35   # 在0.3和0.4之间找平衡
+                               # 65%主任务，35%后门
 
-# 5. 跨轮次触发器轮换
-cross_round_rotation:
-  enabled: true
-  rotation_strategy: 'adversary_specific'  
-  # 可选策略:
-  # - 'sequential': 顺序轮换，所有攻击者同步
-  # - 'random': 随机选择因子组合
-  # - 'adversary_specific': 每个攻击者独立轮换
-  # - 'diverse': 确保不同攻击者使用不同组合
-  
-  rotation_frequency: 1  # 每N个epoch轮换一次
-  
-  # 轮换模式
-  patterns:
-    # 示例：3轮次轮换模式
-    round_0: [0, 1, 2]  # {F1, F2, F3}
-    round_1: [1, 2, 3]  # {F2, F3, F4}
-    round_2: [2, 3, 4]  # {F3, F4, F5}
-  
-  description: |
-    在不同训练轮次中使用不同的子因子组合
-    即使某种组合被识别，依然能通过轮换继续攻击
+# 轮换策略
+rotation_strategy: 'adversary_specific'
+rotation_frequency: 1
 
-# 6. 隐蔽性增强
-stealthiness_enhancement:
-  # 梯度掩码
-  gradient_masking:
-    enabled: true
-    mask_ratio: 0.1  # 随机掩盖10%的梯度
-  
-  # 噪声注入
-  noise_injection:
-    enabled: true
-    noise_level: 0.01
-    noise_type: 'gaussian'
-  
-  # 模型更新约束
-  update_constraint:
-    enabled: true
-    max_norm: 2.0  # 限制更新的L2范数
-    clip_gradients: true
-
-# ============= 攻击目标配置 =============
+# 攻击目标（微调）
 target_class: 2
-bkd_ratio: 0.25  # 每批次投毒样本比例
+bkd_ratio: 0.18               # 15% → 18%（折中）
 
-# ============= 实验场景配置 =============
-
-# 场景1: 高隐蔽性攻击
-scenario_high_stealth:
-  k_of_m_k: 3
-  k_of_m_m: 5
-  num_adversaries: 2
-  bkd_ratio: 0.15
-  task_separation_weight: 0.3
-  rotation_strategy: 'diverse'
-  description: "最大化隐蔽性，单个因子几乎无影响"
-
-# 场景2: 平衡型攻击（推荐）
-scenario_balanced:
-  k_of_m_k: 2
-  k_of_m_m: 3
-  num_adversaries: 4
-  bkd_ratio: 0.25
-  task_separation_weight: 0.5
-  rotation_strategy: 'adversary_specific'
-  description: "平衡攻击成功率、隐蔽性和协同效果"
-
-# 场景3: 高成功率攻击
-scenario_high_success:
-  k_of_m_k: 2
-  k_of_m_m: 2
-  num_adversaries: 6
-  bkd_ratio: 0.35
-  task_separation_weight: 0.7
-  rotation_strategy: 'sequential'
-  description: "优先保证攻击成功率"
-
-# 场景4: 大规模协同攻击
-scenario_large_scale:
-  k_of_m_k: 2
-  k_of_m_m: 4
-  num_adversaries: 14
-  bkd_ratio: 0.2
-  task_separation_weight: 0.4
-  rotation_strategy: 'diverse'
-  description: "多个攻击者使用不同因子组合协同"
-
-# ============= 评估配置 =============
-evaluation:
-  metrics:
-    - 'attack_success_rate'      # 攻击成功率
-    - 'main_task_accuracy'       # 主任务准确率
-    - 'factor_diversity'         # 因子多样性
-    - 'stealth_score'           # 隐蔽性评分
-    - 'robustness_to_defense'   # 对防御的鲁棒性
-  
-  # 分别评估不同因子组合
-  evaluate_factor_combinations: true
-  
-  # 评估k-of-m规则的效果
-  evaluate_k_of_m_variations:
-    - {k: 1, m: 3}  # 单因子
-    - {k: 2, m: 3}  # 双因子（推荐）
-    - {k: 3, m: 3}  # 全因子
-  
-  # 评估轮换策略效果
-  evaluate_rotation_strategies: true
-
-# ============= 防御对抗测试 =============
-defense_testing:
-  # 测试对不同防御的效果
-  defenses:
-    - name: 'krum'
-      config: {num_adversaries: 4, k_of_m_k: 2, k_of_m_m: 3}
-    
-    - name: 'trimmed_mean'
-      config: {num_adversaries: 6, k_of_m_k: 2, k_of_m_m: 4}
-    
-    - name: 'norm_clipping'
-      config: {clip_factor: 1.5, k_of_m_k: 3, k_of_m_m: 5}
-    
-    - name: 'differential_privacy'
-      config: {noise_level: 0.01, k_of_m_k: 2, k_of_m_m: 3}
+# 评估频率
+eval_freq: 10
 
 # ============= 可视化配置 =============
 visualization:
   enabled: true
-  save_trigger_images: true
-  visualize_factor_effects: true
-  visualize_rotation_pattern: true
   save_interval: 10
-
-# ============= 日志配置 =============
-logging:
-  log_factor_usage: true
-  log_rotation_history: true
-  log_dynamic_intensity: true
-  log_task_separation_loss: true
-  log_interval: 5
-
-# ============= 高级配置 =============
-
-# 因子依赖关系（可选）
-factor_dependencies:
-  enabled: false
-  # 定义某些因子组合的协同效果
-  synergies:
-    - factors: [0, 5]  # 位置因子 + 颜色因子
-      boost: 1.2       # 组合时效果提升20%
-    - factors: [2, 8]  # 频域因子 + 几何因子
-      boost: 1.15
-
-# 自适应因子选择
-adaptive_factor_selection:
-  enabled: false
-  # 根据数据集特征自动选择最有效的因子
-  selection_method: 'importance_sampling'
-  update_frequency: 10  # 每10轮更新一次因子选择
-
-# 多目标优化
-multi_objective_optimization:
-  enabled: false
-  objectives:
-    - name: 'asr'
-      weight: 0.5
-    - name: 'stealth'
-      weight: 0.3
-    - name: 'persistence'
-      weight: 0.2
+  save_dir: './visualizations_final'
 
 # ============= 输出配置 =============
-environment_name: 'factorized_attack'
+environment_name: 'factorized_final'
 save_model: true
-save_on_epochs: [50, 100]
-results_dir: './results/factorized'
+save_on_epochs: [50, 100, 150, 200]
+results_dir: './results/factorized_final'
+
