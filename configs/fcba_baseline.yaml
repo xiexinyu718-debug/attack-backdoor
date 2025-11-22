@@ -1,0 +1,74 @@
+# ============================================================================
+# FCBA (Factorized Trigger Backdoor Attack) 基线配置
+# 用于对比实验 - 500轮完整训练
+# ============================================================================
+
+# ============= 基础配置 =============
+dataset: 'cifar10'
+seed: 42
+epochs: 500                    # 🔴 500轮完整训练
+poison_epochs: 500
+poison_start_epoch: 0
+
+# ============= 联邦学习配置 =============
+num_total_participants: 100
+num_sampled_participants: 10
+num_adversaries: 4             # 标准：4个攻击者
+sample_method: 'random'        # IID数据分布
+dirichlet_alpha: 0.9
+
+# ============= 训练配置 =============
+lr: 0.01                       # 标准学习率
+target_lr: 0.01
+lr_method: 'step'
+lr_decay_epochs: [250, 375]    # 在50%, 75%处衰减
+lr_decay_factor: 0.1
+
+momentum: 0.9
+decay: 0.0005                  # 标准权重衰减
+batch_size: 64
+test_batch_size: 1024
+retrain_times: 2               # 良性客户端训练2次
+attacker_retrain_times: 2      # 攻击者训练2次
+
+# ============= 聚合方法配置 =============
+agg_method: 'avg'              # 标准FedAvg
+clip_factor: 1
+
+# ============= 因子化攻击核心配置 =============
+attacker_method: 'factorized'
+
+# k-of-m规则（核心）
+k_of_m_k: 2                    # 训练时随机选2个因子
+k_of_m_m: 3                    # 推理时应用全部3个因子
+
+# 动态强度调度（标准配置）
+initial_intensity: 0.10        # 初始10%
+final_intensity: 0.50          # 最终50%
+
+# 任务分离权重（平衡配置）
+task_separation_weight: 0.50   # 50%后门 + 50%主任务
+
+# 轮换策略
+rotation_strategy: 'adversary_specific'  # 每个攻击者独立轮换
+rotation_frequency: 1                     # 每轮都轮换
+
+# 攻击目标
+target_class: 2
+bkd_ratio: 0.25                # 标准25%投毒率
+
+# 评估频率
+eval_freq: 10                  # 每10轮评估一次
+
+# ============= 可视化配置 =============
+visualization:
+  enabled: true
+  save_interval: 20            # 每20轮保存一次（降低开销）
+  save_dir: './visualizations_baseline'
+
+# ============= 输出配置 =============
+environment_name: 'fcba_baseline_500ep'
+save_model: true
+save_on_epochs: [100, 200, 300, 400, 500]
+results_dir: './results/fcba_baseline_500ep'
+
