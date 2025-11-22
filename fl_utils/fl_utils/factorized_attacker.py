@@ -1,0 +1,432 @@
+"""
+因子化触发器攻击器主模块
+实现k-of-m组合规则、动态优化、任务分离和跨轮次轮换
+"""
+
+import sys
+sys.path.append("../")
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import copy
+import random
+from collections import defaultdict
+
+from .trigger_factors import (
+    PositionPerturbationFactor,
+    FrequencyPerturbationFactor,
+    ColorShiftFactor,
+    GeometricPerturbationFactor
+)
+
+
+class FactorizedAttacker:
+    """
+    因子化触发器攻击器
+
+    核心功能:
+    1. 触发器因子化 - 将触发器分解为多个子因子
+    2. k-of-m组合规则 - 只有k个因子同时存在时才触发
+    3. 动态优化 - 根据训练进度调整触发器强度
+    4. 任务分离 - 后门任务和主任务完全分离
+    5. 跨轮次轮换 - 不同轮次使用不同因子组合
+    """
+
+    def __init__(self, helper):
+        """
+        初始化攻击器
+
+        Args:
+            helper: Helper对象，包含配置和数据
+        """
+        self.helper = helper
+        self.config = helper.config
+
+        # 1. 初始化触发器因子库
+        self.factor_library = self._init_factor_library()
+        print(f"✓ 初始化了 {len(self.factor_library)} 个触发器因子")
+
+        # 2. k-of-m组合规则
+        self.k = self.config.get('k_of_m_k', 2)  # 至少k个因子
+        self.m = self.config.get('k_of_m_m', 3)  # 总共m个因子
+        print(f"✓ k-of-m规则: {self.k}-of-{self.m}")
+
+        # 3. 当前激活的因子组合 {adversary_id: [factor_indices]}
+        self.active_combinations = {}
+
+        # 4. 记录每个adversary当前的epoch（避免重复添加历史）
+        self.last_assigned_epoch = {}
+
+        # 5. 跨轮次轮换配置
+        self.rotation_strategy = self.config.get('rotation_strategy', 'adversary_specific')
+        self.rotation_frequency = self.config.get('rotation_frequency', 1)
+        self.rotation_history = {}  # 记录轮换历史
+        print(f"✓ 轮换策略: {self.rotation_strategy} (每 {self.rotation_frequency} 轮)")
+
+        # 6. 动态优化配置
+        self.intensity_schedule = self._create_intensity_schedule()
+        print(f"✓ 动态强度调度: {len(self.intensity_schedule)} 个轮次")
+
+        # 7. 任务分离配置
+        self.task_separation_weight = self.config.get('task_separation_weight', 0.5)
+        print(f"✓ 任务分离权重: {self.task_separation_weight}")
+
+        print()
+
+    def _init_factor_library(self):
+        """
+        初始化触发器因子库
+        创建所有可用的因子实例
+        """
+        factors = []
+
+        # 1. 位置扰动因子（5个位置）
+        positions = [
+            ((2, 2), 'square', '左上角'),
+            ((2, 26), 'square', '右上角'),
+            ((26, 2), 'square', '左下角'),
+            ((26, 26), 'square', '右下角'),
+            ((14, 14), 'cross', '中心十字'),
+        ]
+        for pos, pattern, desc in positions:
+            factors.append(PositionPerturbationFactor(
+                position=pos,
+                size=4,
+                pattern=pattern,
+                intensity=0.15
+            ))
+
+        # 2. 频域扰动因子（3个频段）
+        for freq_range in ['high', 'low', 'mid']:
+            factors.append(FrequencyPerturbationFactor(
+                freq_range=freq_range,
+                intensity=0.05
+            ))
+
+        # 3. 颜色偏移因子（3种类型）
+        for shift_type in ['brightness', 'contrast', 'hue']:
+            factors.append(ColorShiftFactor(
+                shift_type=shift_type,
+                intensity=0.1
+            ))
+
+        # 4. 几何扰动因子（3种变换）
+        geometric_configs = [
+            ('translate', {'shift_x': 2, 'shift_y': 0}),
+            ('translate', {'shift_x': 0, 'shift_y': 2}),
+            ('translate', {'shift_x': 1, 'shift_y': 1}),
+        ]
+        for transform_type, params in geometric_configs:
+            factors.append(GeometricPerturbationFactor(
+                transform_type=transform_type,
+                params=params,
+                intensity=0.1
+            ))
+
+        return factors
+
+    def _create_intensity_schedule(self):
+        """
+        创建动态强度调度
+
+        策略：指数增长
+        - 初期：强度低（0.1）- 避免被检测
+        - 后期：强度高（0.5）- 确保攻击成功
+        """
+        total_epochs = self.config.get('epochs', 100)
+        poison_epochs = self.config.get('poison_epochs', 100)
+
+        # 从配置读取参数
+        initial_intensity = self.config.get('initial_intensity', 0.1)
+        final_intensity = self.config.get('final_intensity', 0.5)
+
+        schedule = {}
+        for epoch in range(poison_epochs):
+            # 指数增长曲线: y = a + b * (1 - e^(-cx))
+            progress = epoch / poison_epochs
+            intensity = initial_intensity + \
+                       (final_intensity - initial_intensity) * \
+                       (1 - np.exp(-3 * progress))
+            schedule[epoch] = intensity
+
+        return schedule
+
+    def assign_factor_combination(self, adversary_id, epoch):
+        """
+        为攻击者分配因子组合 - 实现跨轮次轮换
+
+        Args:
+            adversary_id: 攻击者ID（在攻击者列表中的索引）
+            epoch: 当前轮次
+
+        Returns:
+            combination: 选中的因子索引列表
+        """
+        # 检查是否已经为这个epoch分配过（避免重复添加历史）
+        if adversary_id in self.last_assigned_epoch:
+            if self.last_assigned_epoch[adversary_id] == epoch:
+                # 已经分配过，直接返回当前组合
+                return self.active_combinations[adversary_id]
+
+        # 初始化历史记录
+        if adversary_id not in self.rotation_history:
+            self.rotation_history[adversary_id] = []
+
+        # 根据轮换策略选择因子
+        if self.rotation_strategy == 'sequential':
+            # 顺序轮换 - 所有攻击者同步
+            offset = (epoch // self.rotation_frequency) % len(self.factor_library)
+            combination = [(offset + i) % len(self.factor_library)
+                          for i in range(self.m)]
+
+        elif self.rotation_strategy == 'random':
+            # 随机选择 - 每次随机抽取m个因子
+            combination = random.sample(range(len(self.factor_library)), self.m)
+
+        elif self.rotation_strategy == 'adversary_specific':
+            # 每个攻击者独立轮换 - 确保每个epoch、每个攻击者都有不同的组合
+
+            # 计算基础偏移（每个攻击者不同）
+            base_offset = adversary_id * self.m
+
+            # 计算epoch偏移（每rotation_frequency轮变化一次）
+            epoch_step = epoch // self.rotation_frequency
+            epoch_offset = epoch_step % (len(self.factor_library) - self.m + 1)
+
+            # 组合索引（确保在有效范围内）
+            combination = []
+            for i in range(self.m):
+                factor_idx = (base_offset + epoch_offset + i) % len(self.factor_library)
+                combination.append(factor_idx)
+
+        elif self.rotation_strategy == 'diverse':
+            # 确保不同攻击者使用不同组合
+            num_adversaries = self.config.get('num_adversaries', 1)
+            step = len(self.factor_library) // num_adversaries
+            base = (adversary_id * step + epoch // self.rotation_frequency) % \
+                   len(self.factor_library)
+            combination = [(base + i) % len(self.factor_library)
+                          for i in range(self.m)]
+
+        else:
+            # 默认：固定组合
+            combination = list(range(min(self.m, len(self.factor_library))))
+
+        # 记录到历史（只在组合真正变化时记录）
+        should_record = True
+        if len(self.rotation_history[adversary_id]) > 0:
+            last_combination = self.rotation_history[adversary_id][-1]['combination']
+            if last_combination == combination:
+                should_record = False
+
+        if should_record:
+            self.rotation_history[adversary_id].append({
+                'epoch': epoch,
+                'combination': combination
+            })
+
+        # 更新当前激活组合和epoch记录
+        self.active_combinations[adversary_id] = combination
+        self.last_assigned_epoch[adversary_id] = epoch
+
+        return combination
+
+    def apply_k_of_m_trigger(self, inputs, adversary_id, epoch, eval_mode=False):
+        """
+        应用k-of-m组合规则的触发器
+
+        训练模式：随机选择k个因子（提高隐蔽性）
+        评估模式：应用所有m个因子（确保攻击成功）
+
+        Args:
+            inputs: 输入张量 [batch, 3, 32, 32]
+            adversary_id: 攻击者ID
+            epoch: 当前轮次
+            eval_mode: 是否为评估模式
+
+        Returns:
+            perturbed: 应用触发器后的张量
+        """
+        # 确保当前epoch有分配的组合
+        if adversary_id not in self.active_combinations:
+            self.assign_factor_combination(adversary_id, epoch)
+        else:
+            # 检查是否需要轮换
+            last_epoch = self.last_assigned_epoch.get(adversary_id, -1)
+            # 如果epoch变化了，重新分配
+            if last_epoch != epoch:
+                self.assign_factor_combination(adversary_id, epoch)
+
+        combination = self.active_combinations[adversary_id]
+
+        # 获取当前轮次的强度倍数
+        intensity_multiplier = self.intensity_schedule.get(epoch, 0.3)
+
+        # 选择要应用的因子
+        if eval_mode:
+            # 评估模式：应用所有m个因子
+            factors_to_apply = combination
+        else:
+            # 训练模式：随机选择k个因子
+            factors_to_apply = random.sample(combination, self.k)
+
+        # 逐个应用选中的因子
+        perturbed = inputs.clone()
+        for factor_idx in factors_to_apply:
+            factor = self.factor_library[factor_idx]
+
+            # 临时调整因子强度（乘以动态倍数）
+            original_intensity = factor.intensity
+            factor.intensity = original_intensity * intensity_multiplier
+
+            # 应用因子
+            perturbed = factor.apply(perturbed)
+
+            # 恢复原始强度
+            factor.intensity = original_intensity
+
+        return perturbed
+
+    def poison_input(self, inputs, labels, adversary_id, epoch, eval=False):
+        """
+        对输入数据进行投毒（对外接口，兼容原代码）
+
+        Args:
+            inputs: 输入数据
+            labels: 标签
+            adversary_id: 攻击者ID
+            epoch: 当前轮次
+            eval: 是否为评估模式
+
+        Returns:
+            poisoned_inputs: 投毒后的输入
+            poisoned_labels: 修改后的标签
+            poison_num: 投毒样本数量
+        """
+        return self.poison_input_with_task_separation(
+            inputs, labels, adversary_id, epoch, eval
+        )
+
+    def poison_input_with_task_separation(self, inputs, labels, adversary_id,
+                                          epoch, eval_mode=False):
+        """
+        使用任务分离策略进行投毒
+
+        任务分离：确保后门任务与主任务完全分离
+        - 投毒样本：修改为目标类别
+        - 正常样本：保持原标签
+
+        Args:
+            inputs: 输入数据
+            labels: 标签
+            adversary_id: 攻击者ID
+            epoch: 当前轮次
+            eval_mode: 是否为评估模式
+
+        Returns:
+            poisoned_inputs: 投毒后的输入
+            poisoned_labels: 修改后的标签
+            poison_num: 投毒样本数量
+        """
+        batch_size = inputs.shape[0]
+
+        # 确定投毒样本数量
+        if eval_mode:
+            # 评估模式：所有样本都投毒
+            poison_num = batch_size
+        else:
+            # 训练模式：部分样本投毒
+            poison_ratio = self.config.get('bkd_ratio', 0.25)
+            poison_num = int(poison_ratio * batch_size)
+
+        # 克隆数据
+        poisoned_inputs = inputs.clone()
+        poisoned_labels = labels.clone()
+
+        # 对选定的样本应用k-of-m触发器
+        if poison_num > 0:
+            poisoned_inputs[:poison_num] = self.apply_k_of_m_trigger(
+                inputs[:poison_num],
+                adversary_id,
+                epoch,
+                eval_mode
+            )
+            # 修改标签为目标类别
+            poisoned_labels[:poison_num] = self.config.target_class
+
+        return poisoned_inputs, poisoned_labels, poison_num
+
+    def get_factor_info(self):
+        """获取因子库信息（用于调试和可视化）"""
+        info = {
+            'total_factors': len(self.factor_library),
+            'k_of_m': f"{self.k}-of-{self.m}",
+            'factor_names': [f.name for f in self.factor_library],
+            'active_adversaries': len(self.active_combinations),
+            'rotation_strategy': self.rotation_strategy
+        }
+        return info
+
+    def get_active_factors(self, adversary_id):
+        """获取指定攻击者的激活因子"""
+        if adversary_id not in self.active_combinations:
+            return []
+
+        combination = self.active_combinations[adversary_id]
+        return [self.factor_library[i].name for i in combination]
+
+    def get_rotation_history(self, adversary_id):
+        """获取指定攻击者的轮换历史"""
+        return self.rotation_history.get(adversary_id, [])
+
+
+if __name__ == '__main__':
+    # 测试代码
+    print("测试因子化攻击器模块\n")
+
+    # 创建模拟的helper对象
+    class MockHelper:
+        class MockConfig:
+            def get(self, key, default=None):
+                config_dict = {
+                    'k_of_m_k': 2,
+                    'k_of_m_m': 3,
+                    'rotation_strategy': 'adversary_specific',
+                    'rotation_frequency': 1,
+                    'epochs': 100,
+                    'poison_epochs': 100,
+                    'task_separation_weight': 0.5,
+                    'bkd_ratio': 0.25,
+                    'target_class': 2,
+                    'num_adversaries': 4
+                }
+                return config_dict.get(key, default)
+
+        config = MockConfig()
+
+    # 创建攻击器
+    helper = MockHelper()
+    attacker = FactorizedAttacker(helper)
+
+    # 测试因子分配
+    print("\n测试因子分配:")
+    for adv_id in range(3):
+        for epoch in [0, 5, 10]:
+            combination = attacker.assign_factor_combination(adv_id, epoch)
+            factor_names = [attacker.factor_library[i].name for i in combination]
+            print(f"  Adversary {adv_id}, Epoch {epoch}: {factor_names}")
+
+    # 测试触发器应用
+    print("\n测试触发器应用:")
+    test_input = torch.rand(4, 3, 32, 32).cuda()
+    test_labels = torch.tensor([0, 1, 2, 3]).cuda()
+
+    poisoned, labels, num = attacker.poison_input(
+        test_input, test_labels,
+        adversary_id=0, epoch=10, eval=False
+    )
+    print(f"  投毒样本数: {num}/{test_input.shape[0]}")
+    print(f"  标签变化: {test_labels} -> {labels}")
+    print(f"  扰动范数: {torch.norm(poisoned - test_input).item():.6f}")

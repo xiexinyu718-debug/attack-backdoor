@@ -1,0 +1,381 @@
+"""
+评估指标模块
+提供各种评估函数：ASR、主任务准确率、隐蔽性、因子多样性等
+"""
+
+import torch
+import numpy as np
+from collections import defaultdict
+
+
+class FactorizedAttackEvaluator:
+    """
+    因子化攻击评估器
+    提供全面的评估指标
+    """
+    
+    def __init__(self, helper, attacker):
+        """
+        Args:
+            helper: Helper对象
+            attacker: FactorizedAttacker实例
+        """
+        self.helper = helper
+        self.attacker = attacker
+        self.config = helper.config
+        
+    def evaluate_main_task(self, model):
+        """
+        评估主任务准确率（良性样本）
+        
+        Args:
+            model: 要评估的模型
+            
+        Returns:
+            accuracy: 准确率（百分比）
+        """
+        model.eval()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for inputs, labels in self.helper.test_data:
+                inputs, labels = inputs.cuda(), labels.cuda()
+                outputs = model(inputs)
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+        
+        model.train()
+        accuracy = 100.0 * correct / total if total > 0 else 0
+        return accuracy
+    
+    def evaluate_attack_success_rate(self, model, adversary_id, epoch):
+        """
+        评估攻击成功率（使用所有m个因子）
+        
+        Args:
+            model: 要评估的模型
+            adversary_id: 攻击者ID
+            epoch: 当前轮次
+            
+        Returns:
+            asr: 攻击成功率（百分比）
+        """
+        model.eval()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for inputs, labels in self.helper.test_data:
+                inputs, labels = inputs.cuda(), labels.cuda()
+                
+                # 应用触发器（评估模式：使用所有m个因子）
+                poisoned_inputs, poisoned_labels, _ = \
+                    self.attacker.poison_input_with_task_separation(
+                        inputs, labels, adversary_id, epoch, eval_mode=True
+                    )
+                
+                outputs = model(poisoned_inputs)
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(poisoned_labels).sum().item()
+        
+        model.train()
+        asr = 100.0 * correct / total if total > 0 else 0
+        return asr
+    
+    def evaluate_all_adversaries(self, model, epoch):
+        """
+        评估所有攻击者的ASR
+        
+        Args:
+            model: 要评估的模型
+            epoch: 当前轮次
+            
+        Returns:
+            results: {adversary_id: asr} 字典
+        """
+        results = {}
+        num_adversaries = self.config.get('num_adversaries', 1)
+        
+        for adv_id in range(num_adversaries):
+            asr = self.evaluate_attack_success_rate(model, adv_id, epoch)
+            results[adv_id] = asr
+        
+        return results
+    
+    def calculate_factor_diversity(self):
+        """
+        计算因子使用的多样性
+        使用Shannon熵衡量
+        
+        Returns:
+            diversity: 多样性分数（0-1）
+        """
+        if len(self.attacker.active_combinations) == 0:
+            return 0.0
+        
+        # 统计每个因子的使用频率
+        factor_counts = defaultdict(int)
+        total_uses = 0
+        
+        for combination in self.attacker.active_combinations.values():
+            for factor_idx in combination:
+                factor_counts[factor_idx] += 1
+                total_uses += 1
+        
+        if total_uses == 0:
+            return 0.0
+        
+        # 计算Shannon熵
+        entropy = 0.0
+        for count in factor_counts.values():
+            p = count / total_uses
+            if p > 0:
+                entropy -= p * np.log2(p)
+        
+        # 归一化到[0, 1]
+        max_entropy = np.log2(len(self.attacker.factor_library))
+        diversity = entropy / max_entropy if max_entropy > 0 else 0.0
+        
+        return diversity
+    
+    def calculate_stealthiness(self, local_model, global_model):
+        """
+        计算模型更新的隐蔽性
+        使用L2范数衡量，范数越小越隐蔽
+        
+        Args:
+            local_model: 本地模型
+            global_model: 全局模型
+            
+        Returns:
+            stealth_score: 隐蔽性分数（L2范数）
+        """
+        if local_model is None or global_model is None:
+            return 0.0
+        
+        total_norm = 0.0
+        num_params = 0
+        
+        for (name1, param1), (name2, param2) in zip(
+            local_model.named_parameters(),
+            global_model.named_parameters()
+        ):
+            if name1 == name2:
+                diff = param1.data - param2.data
+                total_norm += torch.sum(diff ** 2).item()
+                num_params += param1.numel()
+        
+        # 归一化
+        if num_params > 0:
+            return np.sqrt(total_norm / num_params)
+        return 0.0
+    
+    def evaluate_k_of_m_variations(self, model, epoch):
+        """
+        测试不同k-of-m配置的效果
+        
+        Args:
+            model: 要评估的模型
+            epoch: 当前轮次
+            
+        Returns:
+            results: {config_name: asr} 字典
+        """
+        results = {}
+        
+        # 保存原始配置
+        original_k = self.attacker.k
+        original_m = self.attacker.m
+        
+        # 测试不同配置
+        test_configs = [
+            (1, 3, '单因子'),
+            (2, 3, '双因子'),
+            (3, 3, '全因子'),
+        ]
+        
+        for k, m, desc in test_configs:
+            # 临时修改配置
+            self.attacker.k = k
+            self.attacker.m = m
+            
+            # 评估（只测试第一个攻击者）
+            asr = self.evaluate_attack_success_rate(model, 0, epoch)
+            results[f'k={k}, m={m} ({desc})'] = asr
+        
+        # 恢复配置
+        self.attacker.k = original_k
+        self.attacker.m = original_m
+        
+        return results
+    
+    def analyze_rotation_effectiveness(self):
+        """
+        分析轮换策略的有效性
+        通过检查历史组合的变化率
+        
+        Returns:
+            effectiveness: 有效性分数（0-1）
+        """
+        if len(self.attacker.rotation_history) == 0:
+            return 0.0
+        
+        change_rates = []
+        
+        for adv_id, history in self.attacker.rotation_history.items():
+            if len(history) < 2:
+                continue
+            
+            # 计算相邻组合的变化次数
+            changes = 0
+            for i in range(1, len(history)):
+                prev_combo = set(history[i-1]['combination'])
+                curr_combo = set(history[i]['combination'])
+                
+                # 如果组合不同，记录一次变化
+                if prev_combo != curr_combo:
+                    changes += 1
+            
+            # 计算变化率
+            change_rate = changes / (len(history) - 1) if len(history) > 1 else 0
+            change_rates.append(change_rate)
+        
+        # 返回平均变化率
+        return np.mean(change_rates) if change_rates else 0.0
+    
+    def comprehensive_evaluation(self, model, epoch):
+        """
+        全面评估
+        
+        Args:
+            model: 要评估的模型
+            epoch: 当前轮次
+            
+        Returns:
+            results: 包含所有评估指标的字典
+        """
+        print(f"\n{'='*70}")
+        print(f"全面评估 - Epoch {epoch}")
+        print(f"{'='*70}")
+        
+        results = {}
+        
+        # 1. 主任务准确率
+        print(f"\n[1/6] 评估主任务准确率...")
+        main_acc = self.evaluate_main_task(model)
+        results['main_accuracy'] = main_acc
+        print(f"  主任务准确率: {main_acc:.2f}%")
+        
+        # 2. 攻击成功率
+        print(f"\n[2/6] 评估攻击成功率...")
+        asr_results = self.evaluate_all_adversaries(model, epoch)
+        results['individual_asr'] = asr_results
+        results['average_asr'] = np.mean(list(asr_results.values()))
+        print(f"  平均ASR: {results['average_asr']:.2f}%")
+        for adv_id, asr in asr_results.items():
+            print(f"    Adversary {adv_id}: {asr:.2f}%")
+        
+        # 3. 因子多样性
+        print(f"\n[3/6] 计算因子多样性...")
+        diversity = self.calculate_factor_diversity()
+        results['factor_diversity'] = diversity
+        print(f"  因子多样性: {diversity:.4f}")
+        
+        # 4. 隐蔽性
+        print(f"\n[4/6] 评估隐蔽性...")
+        # 注意：隐蔽性需要在训练过程中评估，此处跳过
+        results['stealthiness'] = None
+        print(f"  隐蔽性: N/A (需要在训练时评估)")
+        
+        # 5. k-of-m有效性
+        print(f"\n[5/6] 测试k-of-m配置...")
+        k_of_m_results = self.evaluate_k_of_m_variations(model, epoch)
+        results['k_of_m_analysis'] = k_of_m_results
+        for config, asr in k_of_m_results.items():
+            print(f"  {config}: {asr:.2f}%")
+        
+        # 6. 轮换有效性
+        print(f"\n[6/6] 分析轮换策略...")
+        rotation_eff = self.analyze_rotation_effectiveness()
+        results['rotation_effectiveness'] = rotation_eff
+        print(f"  轮换有效性: {rotation_eff:.4f}")
+        
+        # 汇总
+        print(f"\n{'='*70}")
+        print(f"评估汇总:")
+        print(f"  主任务准确率: {results['main_accuracy']:.2f}%")
+        print(f"  平均ASR: {results['average_asr']:.2f}%")
+        print(f"  因子多样性: {results['factor_diversity']:.4f}")
+        if results['stealthiness']:
+            print(f"  隐蔽性: {results['stealthiness']:.4f}")
+        print(f"  轮换有效性: {results['rotation_effectiveness']:.4f}")
+        print(f"{'='*70}\n")
+        
+        return results
+
+
+def compare_with_baselines(helper, attacker, model, epoch):
+    """
+    与基线方法对比
+    
+    Args:
+        helper: Helper对象
+        attacker: FactorizedAttacker实例
+        model: 模型
+        epoch: 当前轮次
+    """
+    print(f"\n{'='*70}")
+    print("与基线方法对比")
+    print(f"{'='*70}")
+    
+    evaluator = FactorizedAttackEvaluator(helper, attacker)
+    
+    # 配置不同的方法
+    methods = {
+        'BadNets': {'k': 1, 'm': 1, 'rotation': False},
+        'Distributed': {'k': 1, 'm': 1, 'rotation': True},
+        'Factorized (2-of-3)': {'k': 2, 'm': 3, 'rotation': True},
+        'Factorized (3-of-5)': {'k': 3, 'm': 5, 'rotation': True},
+    }
+    
+    # 保存原始配置
+    original_k = attacker.k
+    original_m = attacker.m
+    
+    results = {}
+    
+    for method_name, config in methods.items():
+        # 应用配置
+        attacker.k = config['k']
+        attacker.m = config['m']
+        
+        # 评估
+        main_acc = evaluator.evaluate_main_task(model)
+        asr = evaluator.evaluate_attack_success_rate(model, 0, epoch)
+        
+        results[method_name] = {
+            'main_acc': main_acc,
+            'asr': asr
+        }
+    
+    # 恢复配置
+    attacker.k = original_k
+    attacker.m = original_m
+    
+    # 打印结果
+    print(f"\n{'方法':<20} {'主任务准确率':<15} {'ASR':<10}")
+    print(f"{'-'*50}")
+    for method, res in results.items():
+        print(f"{method:<20} {res['main_acc']:<15.2f} {res['asr']:<10.2f}")
+    print(f"{'='*70}\n")
+    
+    return results
+
+
+if __name__ == '__main__':
+    print("测试评估模块")
+    print("\n注意：这个模块需要完整的helper和attacker对象才能测试")
+    print("请在主训练循环中使用")
