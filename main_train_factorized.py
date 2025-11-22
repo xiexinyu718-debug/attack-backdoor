@@ -1,5 +1,10 @@
 """
-因子化触发器攻击 - 主训练脚本（修复版）
+因子化触发器攻击 - 主训练脚本（集成MR模块）
+
+新增功能:
+    - 集成Model Replacement (MR)模块
+    - 恶意客户端模型更新自动放大
+    - MR统计信息追踪
 
 使用方法:
     python main_train_factorized.py --gpu 0 --params configs/tmp.yaml
@@ -21,8 +26,9 @@ from datetime import datetime
 from helper import Helper
 from fl_utils.factorized_attacker import FactorizedAttacker
 from fl_utils.task_separation import create_trainer
-from fl_utils.evaluation import FactorizedAttackEvaluator, compare_with_baselines
+from fl_utils.evaluation import FactorizedAttackEvaluator
 from fl_utils.visualization import FactorizedAttackVisualizer, visualize_complete_report
+from model_replacement import ModelReplacementAttacker  # 新增: MR模块
 
 
 def set_seed(seed):
@@ -89,9 +95,9 @@ def train_benign_client(helper, participant_id, model, epoch):
     return model, stats
 
 
-def train_malicious_client(helper, participant_id, model, epoch, attacker, trainer):
+def train_malicious_client(helper, participant_id, model, epoch, attacker, trainer, mr_attacker=None):
     """
-    训练恶意客户端（使用因子化攻击和任务分离）
+    训练恶意客户端（使用因子化攻击、任务分离和MR）
 
     Args:
         helper: Helper对象
@@ -100,6 +106,7 @@ def train_malicious_client(helper, participant_id, model, epoch, attacker, train
         epoch: 当前轮次
         attacker: FactorizedAttacker实例
         trainer: TaskSeparationTrainer实例
+        mr_attacker: ModelReplacementAttacker实例(可选)
 
     Returns:
         model: 训练后的模型
@@ -107,6 +114,8 @@ def train_malicious_client(helper, participant_id, model, epoch, attacker, train
     """
     print(f"\n{'='*60}")
     print(f"训练恶意客户端 {participant_id} (Epoch {epoch})")
+    if mr_attacker is not None:
+        print(f"  ✓ 启用Model Replacement (缩放因子: {mr_attacker._get_current_scale_factor(epoch):.2f})")
     print(f"{'='*60}")
 
     # 获取攻击者索引
@@ -144,6 +153,16 @@ def train_malicious_client(helper, participant_id, model, epoch, attacker, train
         )
         all_stats.append(epoch_stats)
 
+    # 【新增】应用Model Replacement
+    if mr_attacker is not None:
+        print(f"  应用Model Replacement...")
+        original_norm = mr_attacker._compute_update_norm(model, helper.global_model)
+        model = mr_attacker.scale_malicious_update(model, helper.global_model, epoch)
+        scaled_norm = mr_attacker._compute_update_norm(model, helper.global_model)
+        print(f"    原始更新范数: {original_norm:.4f}")
+        print(f"    放大后范数: {scaled_norm:.4f}")
+        print(f"    放大倍数: {scaled_norm / original_norm:.2f}x")
+
     # 汇总统计
     final_stats = {
         'avg_loss': np.mean([s['avg_loss'] for s in all_stats]),
@@ -160,7 +179,7 @@ def train_malicious_client(helper, participant_id, model, epoch, attacker, train
     return model, final_stats
 
 
-def federated_learning_round(helper, attacker, trainer, epoch):
+def federated_learning_round(helper, attacker, trainer, mr_attacker, epoch):
     """
     执行一轮联邦学习
 
@@ -168,6 +187,7 @@ def federated_learning_round(helper, attacker, trainer, epoch):
         helper: Helper对象
         attacker: FactorizedAttacker实例
         trainer: TaskSeparationTrainer实例
+        mr_attacker: ModelReplacementAttacker实例
         epoch: 当前轮次
 
     Returns:
@@ -194,9 +214,9 @@ def federated_learning_round(helper, attacker, trainer, epoch):
         local_model = copy.deepcopy(helper.global_model)
 
         if participant_id in helper.adversary_list:
-            # 恶意训练
+            # 恶意训练 (带MR)
             local_model, stats = train_malicious_client(
-                helper, participant_id, local_model, epoch, attacker, trainer
+                helper, participant_id, local_model, epoch, attacker, trainer, mr_attacker
             )
         else:
             # 良性训练
@@ -212,7 +232,7 @@ def federated_learning_round(helper, attacker, trainer, epoch):
 
 def aggregate_models(helper, local_models):
     """
-    聚合本地模型（FedAvg）- 修复版本
+    聚合本地模型（FedAvg）
 
     Args:
         helper: Helper对象
@@ -267,13 +287,15 @@ def aggregate_models(helper, local_models):
 def main():
     """主函数"""
     # 解析参数
-    parser = argparse.ArgumentParser(description='因子化触发器攻击训练')
+    parser = argparse.ArgumentParser(description='因子化触发器攻击训练(带MR)')
     parser.add_argument('--params', type=str, required=True,
                        help='配置文件路径')
     parser.add_argument('--gpu', type=int, default=0,
                        help='GPU设备ID')
     parser.add_argument('--seed', type=int, default=None,
                        help='随机种子（覆盖配置文件）')
+    parser.add_argument('--disable-mr', action='store_true',
+                       help='禁用Model Replacement')
     args = parser.parse_args()
 
     # 设置GPU
@@ -304,6 +326,14 @@ def main():
     print(f"\n初始化因子化攻击器...")
     attacker = FactorizedAttacker(helper)
 
+    # 【新增】初始化MR攻击器
+    mr_attacker = None
+    if not args.disable_mr:
+        print(f"\n初始化Model Replacement攻击器...")
+        mr_attacker = ModelReplacementAttacker(helper.config, helper)
+    else:
+        print(f"\n⚠️  Model Replacement已禁用")
+
     # 初始化任务分离训练器
     print(f"\n初始化任务分离训练器...")
     trainer = create_trainer(helper.config, adaptive=True)
@@ -321,7 +351,7 @@ def main():
     for epoch in range(helper.config.epochs):
         # 执行一轮联邦学习
         local_models, training_stats = federated_learning_round(
-            helper, attacker, trainer, epoch
+            helper, attacker, trainer, mr_attacker, epoch
         )
 
         # 聚合模型
@@ -338,6 +368,11 @@ def main():
             # 全面评估
             results = evaluator.comprehensive_evaluation(helper.global_model, epoch)
             results['epoch'] = epoch
+
+            # 【新增】添加MR统计
+            if mr_attacker is not None:
+                results['mr_stats'] = mr_attacker.get_statistics()
+
             evaluation_history.append(results)
 
             # 可视化
@@ -369,14 +404,21 @@ def main():
         save_on_epochs = helper.config.get('save_on_epochs', [50, 100])
         if epoch in save_on_epochs or epoch == helper.config.epochs - 1:
             save_path = f"{helper.folder_path}/model_epoch_{epoch}.pt"
-            torch.save({
+            save_data = {
                 'epoch': epoch,
                 'model_state_dict': helper.global_model.state_dict(),
                 'attacker_state': {
                     'active_combinations': attacker.active_combinations,
                     'rotation_history': attacker.rotation_history
                 }
-            }, save_path)
+            }
+
+            # 【新增】保存MR统计
+            if mr_attacker is not None:
+                save_data['mr_stats'] = mr_attacker.get_statistics()
+                save_data['mr_history'] = mr_attacker.history
+
+            torch.save(save_data, save_path)
             print(f"模型已保存: {save_path}")
 
     # 最终评估和报告
@@ -389,15 +431,11 @@ def main():
         helper.config.epochs
     )
 
-    # 与基线对比
-    print(f"\n与基线方法对比...")
-    try:
-        comparison_results = compare_with_baselines(
-            helper, attacker, helper.global_model, helper.config.epochs
-        )
-    except Exception as e:
-        print(f"基线对比失败: {e}")
-        comparison_results = {}
+    # 【新增】打印MR统计
+    if mr_attacker is not None:
+        mr_attacker.print_statistics()
+
+
 
     # 生成最终报告
     print(f"\n生成最终报告...")
@@ -409,12 +447,15 @@ def main():
             'k_of_m': f"{attacker.k}-of-{attacker.m}",
             'rotation_strategy': attacker.rotation_strategy,
             'task_separation_weight': trainer.separation_weight,
-            'total_epochs': helper.config.epochs
+            'total_epochs': helper.config.epochs,
+            'mr_enabled': mr_attacker is not None,  # 新增
+            'mr_scale_factor': mr_attacker.scale_factor if mr_attacker else None  # 新增
         },
         'final_results': final_results,
         'evaluation_history': evaluation_history,
         'baseline_comparison': comparison_results,
-        'factor_info': attacker.get_factor_info()
+        'factor_info': attacker.get_factor_info(),
+        'mr_statistics': mr_attacker.get_statistics() if mr_attacker else None  # 新增
     }
 
     report_path = f"{helper.folder_path}/final_report.json"
@@ -431,6 +472,8 @@ def main():
     print(f"平均ASR: {final_results['average_asr']:.2f}%")
     print(f"因子多样性: {final_results['factor_diversity']:.4f}")
     print(f"轮换有效性: {final_results['rotation_effectiveness']:.4f}")
+    if mr_attacker is not None:
+        print(f"MR平均缩放因子: {mr_attacker.get_statistics()['avg_scale_factor']:.2f}")
     print(f"{'='*70}")
 
     print(f"\n✓ 所有完成！")
