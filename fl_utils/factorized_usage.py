@@ -489,7 +489,7 @@ def main_training_loop(helper):
                 # 良性训练
                 # local_model = train_benign(helper, participant_id, local_model, epoch)
                 pass
-            
+
             local_models[participant_id] = local_model
         
         # 3. 聚合

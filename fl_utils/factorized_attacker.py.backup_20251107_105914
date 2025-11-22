@@ -56,20 +56,17 @@ class FactorizedAttacker:
         # 3. 当前激活的因子组合 {adversary_id: [factor_indices]}
         self.active_combinations = {}
 
-        # 4. 记录每个adversary当前的epoch（避免重复添加历史）
-        self.last_assigned_epoch = {}
-
-        # 5. 跨轮次轮换配置
+        # 4. 跨轮次轮换配置
         self.rotation_strategy = self.config.get('rotation_strategy', 'adversary_specific')
         self.rotation_frequency = self.config.get('rotation_frequency', 1)
         self.rotation_history = {}  # 记录轮换历史
         print(f"✓ 轮换策略: {self.rotation_strategy} (每 {self.rotation_frequency} 轮)")
 
-        # 6. 动态优化配置
+        # 5. 动态优化配置
         self.intensity_schedule = self._create_intensity_schedule()
         print(f"✓ 动态强度调度: {len(self.intensity_schedule)} 个轮次")
 
-        # 7. 任务分离配置
+        # 6. 任务分离配置
         self.task_separation_weight = self.config.get('task_separation_weight', 0.5)
         print(f"✓ 任务分离权重: {self.task_separation_weight}")
 
@@ -164,12 +161,6 @@ class FactorizedAttacker:
         Returns:
             combination: 选中的因子索引列表
         """
-        # 检查是否已经为这个epoch分配过（避免重复添加历史）
-        if adversary_id in self.last_assigned_epoch:
-            if self.last_assigned_epoch[adversary_id] == epoch:
-                # 已经分配过，直接返回当前组合
-                return self.active_combinations[adversary_id]
-
         # 初始化历史记录
         if adversary_id not in self.rotation_history:
             self.rotation_history[adversary_id] = []
@@ -177,7 +168,7 @@ class FactorizedAttacker:
         # 根据轮换策略选择因子
         if self.rotation_strategy == 'sequential':
             # 顺序轮换 - 所有攻击者同步
-            offset = (epoch // self.rotation_frequency) % len(self.factor_library)
+            offset = epoch % len(self.factor_library)
             combination = [(offset + i) % len(self.factor_library)
                           for i in range(self.m)]
 
@@ -186,21 +177,20 @@ class FactorizedAttacker:
             combination = random.sample(range(len(self.factor_library)), self.m)
 
         elif self.rotation_strategy == 'adversary_specific':
-            # 每个攻击者独立轮换 - 确保每个epoch、每个攻击者都有不同的组合
-
+            # 修复：确保每个epoch、每个攻击者都有真正不同的组合
+            # 使用 adversary_id 和 epoch 创建唯一的偏移
+            
             # 计算基础偏移（每个攻击者不同）
             base_offset = adversary_id * self.m
-
-            # 计算epoch偏移（每rotation_frequency轮变化一次）
-            epoch_step = epoch // self.rotation_frequency
-            epoch_offset = epoch_step % (len(self.factor_library) - self.m + 1)
-
+            
+            # 计算epoch偏移（每个epoch变化）
+            epoch_offset = epoch % (len(self.factor_library) - self.m + 1)
+            
             # 组合索引（确保在有效范围内）
             combination = []
             for i in range(self.m):
                 factor_idx = (base_offset + epoch_offset + i) % len(self.factor_library)
                 combination.append(factor_idx)
-
         elif self.rotation_strategy == 'diverse':
             # 确保不同攻击者使用不同组合
             num_adversaries = self.config.get('num_adversaries', 1)
@@ -214,22 +204,14 @@ class FactorizedAttacker:
             # 默认：固定组合
             combination = list(range(min(self.m, len(self.factor_library))))
 
-        # 记录到历史（只在组合真正变化时记录）
-        should_record = True
-        if len(self.rotation_history[adversary_id]) > 0:
-            last_combination = self.rotation_history[adversary_id][-1]['combination']
-            if last_combination == combination:
-                should_record = False
+        # 记录到历史
+        self.rotation_history[adversary_id].append({
+            'epoch': epoch,
+            'combination': combination
+        })
 
-        if should_record:
-            self.rotation_history[adversary_id].append({
-                'epoch': epoch,
-                'combination': combination
-            })
-
-        # 更新当前激活组合和epoch记录
+        # 更新当前激活组合
         self.active_combinations[adversary_id] = combination
-        self.last_assigned_epoch[adversary_id] = epoch
 
         return combination
 
@@ -249,15 +231,10 @@ class FactorizedAttacker:
         Returns:
             perturbed: 应用触发器后的张量
         """
-        # 确保当前epoch有分配的组合
-        if adversary_id not in self.active_combinations:
+        # 获取或分配因子组合
+        if adversary_id not in self.active_combinations or \
+           epoch % self.rotation_frequency == 0:
             self.assign_factor_combination(adversary_id, epoch)
-        else:
-            # 检查是否需要轮换
-            last_epoch = self.last_assigned_epoch.get(adversary_id, -1)
-            # 如果epoch变化了，重新分配
-            if last_epoch != epoch:
-                self.assign_factor_combination(adversary_id, epoch)
 
         combination = self.active_combinations[adversary_id]
 
