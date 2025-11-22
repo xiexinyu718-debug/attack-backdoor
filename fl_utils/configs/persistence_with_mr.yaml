@@ -1,0 +1,93 @@
+# ===============================================
+# 持久性测试配置 - 验证版本
+# 确保投毒参数被正确读取
+# ===============================================
+
+# ============= 基础配置 =============
+dataset: 'cifar10'
+seed: 42
+epochs: 500
+
+# ============= 【关键】投毒控制参数 =============
+# 注意：必须使用 train_with_persistence_test_with_mr.py 脚本
+# 这些参数只在持久性测试脚本中有效
+
+poison_start_epoch: 314   # ← 第340轮开始投毒
+poison_stop_epoch: 327   # ← 第341轮停止投毒（只投毒1轮）
+
+# 兼容性：提供多种参数名（确保被读取）
+poison_epochs: 500        # 旧版本参数名
+start_epoch: 0
+
+# ============= 联邦学习配置 =============
+num_total_participants: 100
+num_sampled_participants: 20  # ← 增加到20以容纳14个恶意客户端
+num_adversaries: 14
+sample_method: 'random'
+dirichlet_alpha: 0.5
+
+# ============= Model Replacement =============
+use_model_replacement: true
+scale_factor_gamma: 50.0
+mr_adaptive: true
+mr_min_scale: 10.0
+mr_max_scale: 100.0
+
+# ============= 训练配置 =============
+lr: 0.1
+target_lr: 0.1
+lr_method: 'constant'
+lr_decay_epochs: []
+
+momentum: 0.9
+decay: 0.0001
+batch_size: 64
+test_batch_size: 1024
+retrain_times: 2
+attacker_retrain_times: 6
+
+# ============= 恶意训练配置 =============
+malicious_lr: 0.05
+
+# ============= 聚合方法 =============
+agg_method: 'avg'
+clip_factor: 1
+
+# ============= 因子化攻击配置 =============
+attacker_method: 'factorized'
+k_of_m_k: 2
+k_of_m_m: 4
+
+initial_intensity: 0.5
+final_intensity: 0.5
+
+task_separation_weight: 0.0
+
+rotation_strategy: 'adversary_specific'
+rotation_frequency: 1
+
+target_class: 2
+bkd_ratio: 0.03125
+
+# ============= 评估配置 =============
+eval_freq: 5
+save_on_epochs: [100, 200, 300, 340, 380, 420, 460, 500]
+
+# ============= 可视化配置 =============
+visualization:
+  enabled: true
+  save_interval: 20
+  save_dir: './visualizations_verified'
+
+# ============= 输出配置 =============
+environment_name: 'persistence_verified'
+save_model: true
+results_dir: './results/persistence_verified'
+
+# ============= 验证信息 =============
+# 预期行为：
+# - Round 0-339:  投毒状态: 未开始, ASR应该是0%或很低（<5%）
+# - Round 340:    投毒状态: 进行中, ASR应该跳到~95%
+# - Round 341+:   投毒状态: 已停止, ASR应该缓慢下降
+
+# 如果Round 30就有ASR>60%，说明配置没有生效！
