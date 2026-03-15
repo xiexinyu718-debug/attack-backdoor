@@ -1,0 +1,81 @@
+dataset: 'cifar10'
+model: 'resnet18'
+environment_name: 'asr_boost_mixed_fulltest'
+
+num_total_participants: 15
+num_adversaries: 4
+num_sampled_participants: 10
+num_malicious_per_round: 4
+
+epochs: 150
+retrain_times: 2
+attacker_retrain_times: 5
+
+lr: 0.06
+lr_scheduler: 'cosine'
+momentum: 0.9
+decay: 0.001
+
+batch_size: 128
+test_batch_size: 200
+
+benign_boost_enabled: false
+benign_extra_epochs: 0
+
+# === 因子化触发器（核心创新） ===
+k_of_m_k: 3                    # ✅ 改为3（启用3-of-5机制）
+k_of_m_m: 5                    # ✅ 改为5（5种触发器因子）
+rotation_frequency: 8          # ✅ 改为8（每8轮轮换）
+
+# === ADCA协同聚合（新增） ===
+enable_malicious_coalition: true  # ✅ 启用ADCA
+coalition_alpha: 0.1              # ✅ ADCA增强系数
+
+# === 良性对齐（禁用） ===
+enable_collaboration: false       # ❌ 禁用旧协同优化（ADCA替代）
+enable_benign_alignment: false    # ❌ 禁用良性对齐（会降低ASR）
+benign_direction_alpha: 0.0       # ❌ 设为0
+target_l2_ratio: 1.0              # ❌ 设为1.0
+enable_distribution_align: false
+
+# === 持久性评估（降低强度） ===
+weight_stability: 0.15         # ⬇️ 从0.25降到0.15
+weight_importance: 0.20        # ⬇️ 从0.30降到0.20
+weight_persistence: 0.10       # ⬇️ 从0.45降到0.10
+persistence_threshold: 0.5     # ⬇️ 从0.6降到0.5
+importance_threshold: 0.5      # ⬇️ 从0.7降到0.5
+dynamic_lambda: true
+
+# === DMBA后门重放（保留并优化） ===
+enable_backdoor_replay: true    # ✅ 启用DMBA
+replay_enabled: true
+replay_start_epoch: 0
+replay_buffer_size: 150
+replay_ratio: 0.5
+replay_sample_selection: 'importance'  # ✅ 改为importance采样
+
+# === 任务分离（禁用简化） ===
+use_task_separation: false      # ❌ 禁用（简化）
+task_separation_adaptive: false
+task_separation_weight: 0.0     # ❌ 设为0
+adaptive_persistence_weights: false  # ❌ 禁用
+selection_ratio: 0.0            # ❌ 设为0（旧协同优化已禁用）
+boost_factor: 1.0               # ❌ 设为1.0（禁用boost）
+enable_direction_consistency: false  # ❌ 禁用
+enable_load_balancing: false    # ❌ 禁用
+enable_selective_boosting: false  # ❌ 禁用
+persistence_eval_samples: 64
+backdoor_cache_size: 128
+
+target_class: 2
+bkd_ratio: 0.40
+poison_start_epoch: 0
+apply_trigger_in_pixel_space: true
+trigger_alpha_schedule: 'constant'
+trigger_alpha_initial: 0.30
+trigger_alpha_final: 0.30
+
+eval_freq: 10
+seed: 42
+
+save_on_epochs: [49, 99, 149]
