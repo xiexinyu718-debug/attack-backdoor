@@ -1,0 +1,300 @@
+"""
+基线性能评估训练脚本 - 带完整隐蔽性评估
+用于实验1：基线性能评估
+"""
+import os
+
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+import argparse
+import yaml
+import torch
+import torch.nn as nn
+import numpy as np
+import random
+import copy
+import json
+
+from helper import Helper
+from fl_utils.factorized_attacker import FactorizedAttacker
+from fl_utils.task_separation import create_trainer
+from fl_utils.evaluation import FactorizedAttackEvaluator
+from fl_utils.visualization import FactorizedAttackVisualizer
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def train_benign_client(helper, participant_id, model, epoch):
+    lr = helper.get_lr(epoch)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=lr,
+        momentum=helper.config.momentum,
+        weight_decay=helper.config.decay
+    )
+
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total_samples = 0
+
+    for _ in range(helper.config.retrain_times):
+        for inputs, labels in helper.train_data[participant_id]:
+            inputs, labels = inputs.cuda(), labels.cuda()
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = nn.functional.cross_entropy(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(labels).sum().item()
+            total_samples += inputs.shape[0]
+
+    accuracy = 100.0 * correct / total_samples if total_samples > 0 else 0
+    avg_loss = total_loss / (len(helper.train_data[participant_id]) * helper.config.retrain_times)
+
+    return model, {'loss': avg_loss, 'accuracy': accuracy, 'total_samples': total_samples}
+
+
+def train_malicious_client(helper, participant_id, model, epoch, attacker, trainer):
+    print(f"\n{'=' * 60}")
+    print(f"训练恶意客户端 {participant_id} (Epoch {epoch})")
+    print(f"{'=' * 60}")
+
+    adversary_id = helper.adversary_list.index(participant_id)
+
+    if epoch % attacker.rotation_frequency == 0:
+        combination = attacker.assign_factor_combination(adversary_id, epoch)
+        factor_names = attacker.get_active_factors(adversary_id)
+        print(f"  因子组合: {factor_names}")
+        print(f"  k-of-m: {attacker.k}-of-{attacker.m}")
+
+    current_intensity = attacker.intensity_schedule.get(epoch, 0.3)
+    print(f"  当前强度: {current_intensity:.3f}")
+
+    lr = helper.get_lr(epoch)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=lr,
+        momentum=helper.config.momentum,
+        weight_decay=helper.config.decay
+    )
+
+    print(f"  开始训练 (重复 {helper.config.attacker_retrain_times} 次)...")
+
+    all_stats = []
+    for internal_epoch in range(helper.config.attacker_retrain_times):
+        epoch_stats = trainer.train_epoch(
+            model, optimizer,
+            helper.train_data[participant_id],
+            attacker, adversary_id, epoch
+        )
+        all_stats.append(epoch_stats)
+
+    final_stats = {
+        'avg_loss': np.mean([s['avg_loss'] for s in all_stats]),
+        'accuracy': all_stats[-1]['accuracy'],
+        'poisoned_samples': sum([s['poisoned_samples'] for s in all_stats]),
+        'total_samples': all_stats[-1]['total_samples']
+    }
+
+    print(f"\n  训练完成:")
+    print(f"    损失: {final_stats['avg_loss']:.4f}")
+    print(f"    准确率: {final_stats['accuracy']:.2f}%")
+    print(f"    投毒样本: {final_stats['poisoned_samples']}/{final_stats['total_samples']}")
+
+    return model, final_stats
+
+
+def federated_learning_round(helper, attacker, trainer, epoch):
+    print(f"\n{'=' * 70}")
+    print(f"联邦学习轮次 {epoch}/{helper.config.epochs}")
+    print(f"{'=' * 70}")
+
+    sampled_participants = helper.sample_participants(epoch)
+    print(f"采样参与者: {sampled_participants}")
+
+    malicious_in_round = [p for p in sampled_participants if p in helper.adversary_list]
+    print(f"恶意客户端: {malicious_in_round if malicious_in_round else '无'}")
+
+    # 【关键】初始化client_models列表
+    helper.client_models = []
+    local_models = {}
+    training_stats = {}
+
+    for participant_id in sampled_participants:
+        local_model = copy.deepcopy(helper.global_model)
+
+        if participant_id in helper.adversary_list:
+            local_model, stats = train_malicious_client(
+                helper, participant_id, local_model, epoch, attacker, trainer
+            )
+        else:
+            local_model, stats = train_benign_client(
+                helper, participant_id, local_model, epoch
+            )
+
+        local_models[participant_id] = local_model
+        training_stats[participant_id] = stats
+
+        # 【关键】保存client model用于隐蔽性评估
+        helper.client_models.append(local_model)
+
+    return local_models, training_stats
+
+
+def aggregate_models(helper, local_models):
+    global_state = helper.global_model.state_dict()
+    weight_accumulator = {}
+
+    for name, param in global_state.items():
+        if param.dtype in [torch.int, torch.int32, torch.int64, torch.long]:
+            continue
+        weight_accumulator[name] = torch.zeros_like(param, dtype=torch.float32)
+
+    for participant_id, local_model in local_models.items():
+        local_state = local_model.state_dict()
+        for name, param in local_state.items():
+            if name not in weight_accumulator:
+                continue
+            global_param = global_state[name]
+            update = param.float() - global_param.float()
+            weight_accumulator[name] += update
+
+    num_participants = len(local_models)
+
+    with torch.no_grad():
+        for name, param in global_state.items():
+            if name not in weight_accumulator:
+                continue
+            avg_update = weight_accumulator[name] / num_participants
+            if param.dtype == torch.float32:
+                param.add_(avg_update)
+            elif param.dtype == torch.float16:
+                param.add_(avg_update.half())
+            elif param.dtype == torch.float64:
+                param.add_(avg_update.double())
+            else:
+                param.add_(avg_update.to(param.dtype))
+
+
+def main():
+    parser = argparse.ArgumentParser(description='基线性能评估(带完整隐蔽性)')
+    parser.add_argument('--params', type=str, required=True, help='配置文件路径')
+    parser.add_argument('--gpu', type=int, default=0, help='GPU设备ID')
+    parser.add_argument('--seed', type=int, default=None, help='随机种子')
+    args = parser.parse_args()
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
+        print(f"使用GPU: {args.gpu}")
+
+    with open(args.params, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    print(f"加载配置: {args.params}")
+
+    seed = args.seed if args.seed is not None else config.get('seed', 0)
+    set_seed(seed)
+    print(f"随机种子: {seed}")
+
+    # 初始化系统
+    print(f"\n初始化系统...")
+    helper = Helper(config)
+    helper.load_data()
+    helper.load_model()
+    helper.config_adversaries()
+
+    attacker = FactorizedAttacker(helper)
+    trainer = create_trainer(helper.config, adaptive=True)
+    evaluator = FactorizedAttackEvaluator(helper, attacker)
+    visualizer = FactorizedAttackVisualizer(
+        save_dir=config.get('visualization', {}).get('save_dir', './visualizations')
+    )
+
+    # 训练循环
+    print(f"\n开始联邦学习训练...")
+    evaluation_history = []
+
+    for epoch in range(helper.config.epochs):
+        # 执行一轮联邦学习（会保存client_models）
+        local_models, training_stats = federated_learning_round(
+            helper, attacker, trainer, epoch
+        )
+
+        # 聚合模型
+        print(f"\n聚合 {len(local_models)} 个本地模型...")
+        aggregate_models(helper, local_models)
+
+        # 定期评估
+        eval_freq = config.get('eval_freq', 10)
+        if epoch % eval_freq == 0 or epoch == helper.config.epochs - 1:
+            print(f"\n{'=' * 70}")
+            print(f"评估 (Epoch {epoch})")
+            print(f"{'=' * 70}")
+
+            # 全面评估（现在会有隐蔽性数据）
+            results = evaluator.comprehensive_evaluation(helper.global_model, epoch)
+            results['epoch'] = epoch
+            evaluation_history.append(results)
+
+        # 保存模型
+        save_on_epochs = helper.config.get('save_on_epochs', [50, 100])
+        if epoch in save_on_epochs or epoch == helper.config.epochs - 1:
+            save_path = f"{helper.folder_path}/model_epoch_{epoch}.pt"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': helper.global_model.state_dict(),
+            }, save_path)
+            print(f"模型已保存: {save_path}")
+
+    # 最终评估和报告
+    print(f"\n{'=' * 70}")
+    print(f"训练完成！最终评估")
+    print(f"{'=' * 70}")
+
+    final_results = evaluator.comprehensive_evaluation(helper.global_model, helper.config.epochs)
+
+    # 生成报告
+    print(f"\n生成最终报告...")
+    report = {
+        'configuration': {
+            'dataset': helper.config.dataset,
+            'num_adversaries': helper.config.num_adversaries,
+            'k_of_m': f"{attacker.k}-of-{attacker.m}",
+            'rotation_strategy': attacker.rotation_strategy,
+            'task_separation_weight': trainer.separation_weight,
+            'total_epochs': helper.config.epochs,
+        },
+        'final_results': final_results,
+        'evaluation_history': evaluation_history,
+        'factor_info': attacker.get_factor_info(),
+    }
+
+    report_path = f"{helper.folder_path}/baseline_report.json"
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+    print(f"\n报告已保存: {report_path}")
+
+    # 打印摘要
+    print(f"\n{'=' * 70}")
+    print(f"基线评估摘要")
+    print(f"{'=' * 70}")
+    print(f"主任务准确率: {final_results['main_accuracy']:.2f}%")
+    print(f"平均ASR: {final_results['average_asr']:.2f}%")
+    print(f"因子多样性: {final_results['factor_diversity']:.4f}")
+    if final_results.get('stealthiness'):
+        print(f"L2比值(恶意/良性): {final_results['stealthiness']['l2_ratio']:.4f}")
+        print(f"归一化隐蔽分数: {final_results['stealthiness']['normalized_stealthiness']:.4f}")
+    print(f"{'=' * 70}")
+
+
+if __name__ == '__main__':
+    main()

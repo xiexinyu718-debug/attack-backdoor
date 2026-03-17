@@ -15,71 +15,26 @@ from collections import defaultdict
 
 
 class Config:
-    """
-    配置类 - 将字典转换为对象属性
-    修复版：正确处理列表类型
-    """
-
+    """配置类 - 将字典转换为对象属性访问"""
     def __init__(self, config_dict):
-        """
-        初始化配置对象
-
-        Args:
-            config_dict: 配置字典
-        """
         for key, value in config_dict.items():
             if isinstance(value, dict):
-                # 🔧 修复：检查字典的所有键是否都是整数
-                if value and all(isinstance(k, int) for k in value.keys()):
-                    # 整数键字典：直接保存为dict（不递归）
-                    # 例如: intensity_schedule = {0: 0.2, 30: 0.3}
-                    setattr(self, key, value)
-                else:
-                    # 字符串键字典：递归创建Config对象
-                    setattr(self, key, Config(value))
-            elif isinstance(value, (list, tuple)):
-                # 列表或元组：直接保存
-                # 避免用整数索引作为属性名
-                setattr(self, key, value)
+                setattr(self, key, Config(value))
             else:
-                # 其他类型（str, int, float, bool等）：直接保存
                 setattr(self, key, value)
-
+    
+    def get(self, key, default=None):
+        """字典式访问"""
+        return getattr(self, key, default)
+    
     def __repr__(self):
-        """字符串表示"""
         return f"Config({self.__dict__})"
 
-    def __str__(self):
-        """打印友好的字符串"""
-        return self.__repr__()
-
-    def get(self, key, default=None):
-        """
-        获取配置值（支持默认值）
-
-        Args:
-            key: 配置键
-            default: 默认值
-
-        Returns:
-            配置值或默认值
-        """
-        return getattr(self, key, default)
-
-    def to_dict(self):
-        """转换回字典"""
-        result = {}
-        for key, value in self.__dict__.items():
-            if isinstance(value, Config):
-                result[key] = value.to_dict()
-            else:
-                result[key] = value
-        return result
 
 class Helper:
     """
     联邦学习Helper类
-
+    
     核心功能:
     1. 数据加载和分割
     2. 模型初始化和管理
@@ -87,11 +42,11 @@ class Helper:
     4. 攻击者配置
     5. 学习率调度
     """
-
+    
     def __init__(self, config):
         """
         初始化Helper
-
+        
         Args:
             config: 配置字典或Config对象
         """
@@ -99,68 +54,65 @@ class Helper:
             self.config = Config(config)
         else:
             self.config = config
-
+        
         # 基础配置
         self.dataset = self.config.dataset
         self.seed = self.config.get('seed', 0)
-
+        
         # 联邦学习配置
         self.num_total_participants = self.config.num_total_participants
-        # 兼容两种配置名称
-        self.num_sampled_participants = self.config.get('num_sampled_participants') or                                         self.config.get('num_participants_per_round', 10)
+        self.num_sampled_participants = self.config.num_sampled_participants
         self.num_adversaries = self.config.num_adversaries
-
+        
         # 训练配置
         self.epochs = self.config.epochs
-        self.batch_size = self.config.get('batch_size', 64)
+        self.batch_size = self.config.batch_size
         self.test_batch_size = self.config.get('test_batch_size', 1024)
-
+        
         # 创建保存目录
         self.folder_path = self.create_folder()
-
+        
         # 初始化容器
         self.train_data = {}  # {participant_id: DataLoader}
         self.test_data = None
         self.global_model = None
         self.client_models = []
         self.adversary_list = []
-
+        
         print(f"Helper初始化完成:")
         print(f"  数据集: {self.dataset}")
         print(f"  参与者总数: {self.num_total_participants}")
         print(f"  每轮采样: {self.num_sampled_participants}")
         print(f"  攻击者数量: {self.num_adversaries}")
         print(f"  保存路径: {self.folder_path}\n")
-
+    
     def create_folder(self):
         """创建实验保存目录"""
         environment_name = self.config.get('environment_name', 'fl_experiment')
         folder_path = f'./saved_models/{environment_name}'
         os.makedirs(folder_path, exist_ok=True)
         return folder_path
-
+    
     def load_data(self):
         """
         加载和分割数据集
         支持: CIFAR-10, CIFAR-100, MNIST
         """
         print(f"加载数据集: {self.dataset}...")
-
+        
         if self.dataset.lower() == 'cifar10':
             self._load_cifar10()
         elif self.dataset.lower() == 'cifar100':
             self._load_cifar100()
         elif self.dataset.lower() == 'mnist':
             self._load_mnist()
-        elif self.dataset.lower() == 'gtsrb':
-            self._load_gtsrb()
         else:
             raise ValueError(f"不支持的数据集: {self.dataset}")
-
+        
         print(f"✓ 数据加载完成")
         print(f"  训练集参与者: {len(self.train_data)}")
         print(f"  测试集大小: {len(self.test_data.dataset)}\n")
-
+    
     def _load_cifar10(self):
         """加载CIFAR-10数据集"""
         # 数据预处理
@@ -168,222 +120,113 @@ class Helper:
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), 
                                (0.2023, 0.1994, 0.2010)),
         ])
-
+        
         transform_test = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), 
                                (0.2023, 0.1994, 0.2010)),
         ])
-
+        
         # 加载数据集
         train_dataset = torchvision.datasets.CIFAR10(
-            root='./data', train=True, download=True,
+            root='./data', train=True, download=True, 
             transform=transform_train
         )
-
+        
         test_dataset = torchvision.datasets.CIFAR10(
-            root='./data', train=False, download=True,
+            root='./data', train=False, download=True, 
             transform=transform_test
         )
-
+        
         # 分割训练数据给各个参与者
         self._split_train_data(train_dataset)
-
+        
         # 创建测试数据加载器
         self.test_data = DataLoader(
-            test_dataset,
+            test_dataset, 
             batch_size=self.test_batch_size,
-            shuffle=False,
+            shuffle=False, 
             num_workers=0
         )
-
+        
         # 设置类别数
         self.num_classes = 10
-
+    
     def _load_cifar100(self):
         """加载CIFAR-100数据集"""
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.5071, 0.4867, 0.4408),
+            transforms.Normalize((0.5071, 0.4867, 0.4408), 
                                (0.2675, 0.2565, 0.2761)),
         ])
-
+        
         transform_test = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.5071, 0.4867, 0.4408),
+            transforms.Normalize((0.5071, 0.4867, 0.4408), 
                                (0.2675, 0.2565, 0.2761)),
         ])
-
+        
         train_dataset = torchvision.datasets.CIFAR100(
-            root='./data', train=True, download=True,
+            root='./data', train=True, download=True, 
             transform=transform_train
         )
-
+        
         test_dataset = torchvision.datasets.CIFAR100(
-            root='./data', train=False, download=True,
+            root='./data', train=False, download=True, 
             transform=transform_test
         )
-
+        
         self._split_train_data(train_dataset)
-
+        
         self.test_data = DataLoader(
-            test_dataset,
+            test_dataset, 
             batch_size=self.test_batch_size,
-            shuffle=False,
+            shuffle=False, 
             num_workers=0
         )
-
+        
         self.num_classes = 100
-
+    
     def _load_mnist(self):
         """加载MNIST数据集"""
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,))
         ])
-
+        
         train_dataset = torchvision.datasets.MNIST(
-            root='./data', train=True, download=True,
+            root='./data', train=True, download=True, 
             transform=transform
         )
-
+        
         test_dataset = torchvision.datasets.MNIST(
-            root='./data', train=False, download=True,
+            root='./data', train=False, download=True, 
             transform=transform
         )
-
+        
         self._split_train_data(train_dataset)
-
+        
         self.test_data = DataLoader(
-            test_dataset,
+            test_dataset, 
             batch_size=self.test_batch_size,
-            shuffle=False,
+            shuffle=False, 
             num_workers=0
         )
-
+        
         self.num_classes = 10
-
-
-    def _load_gtsrb(self):
-        """
-        加载GTSRB数据集
-        使用预处理好的numpy数组
-        """
-        import sys
-        sys.path.insert(0, '.')
-
-        # 导入GTSRB数据加载函数
-        from gtsrb_dataset import (
-            load_gtsrb_preprocessed,
-            create_non_iid_gtsrb,
-            GTSRBDatasetNumpy
-        )
-
-        print(f"加载GTSRB数据集...")
-
-        # 从预处理文件加载数据
-        preprocessed_folder = self.config.get('preprocessed_folder', './data/preprocessed')
-        train_images, train_labels, test_images, test_labels = load_gtsrb_preprocessed(
-            preprocessed_folder,
-            image_size=32
-        )
-
-        print(f"  训练集: {len(train_images)} 样本")
-        print(f"  测试集: {len(test_images)} 样本")
-
-        # 创建Non-IID数据分布
-        non_iid = self.config.get('non_iid', True)
-        non_iid_alpha = self.config.get('non_iid_alpha', 0.5)
-
-        if non_iid:
-            print(f"  创建Non-IID分布 (alpha={non_iid_alpha})...")
-            participant_indices = create_non_iid_gtsrb(
-                train_images,
-                train_labels,
-                num_participants=self.num_total_participants,
-                alpha=non_iid_alpha
-            )
-        else:
-            # IID分布：平均分配
-            print(f"  创建IID分布...")
-            indices = np.arange(len(train_images))
-            np.random.shuffle(indices)
-            participant_indices = np.array_split(indices, self.num_total_participants)
-
-        # 数据增强（GTSRB统计值）
-        transform_train = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.RandomRotation(15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            transforms.Normalize((0.3337, 0.3064, 0.3171),
-                               (0.2672, 0.2564, 0.2629))
-        ])
-
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.3337, 0.3064, 0.3171),
-                               (0.2672, 0.2564, 0.2629))
-        ])
-
-        # 为每个参与者创建DataLoader
-        print(f"  创建{self.num_total_participants}个参与者的数据加载器...")
-        self.train_data = {}
-
-        for participant_id in range(self.num_total_participants):
-            indices = participant_indices[participant_id]
-            participant_images = train_images[indices]
-            participant_labels = train_labels[indices]
-
-            # 创建数据集
-            dataset = GTSRBDatasetNumpy(
-                participant_images,
-                participant_labels,
-                transform=transform_train
-            )
-
-            # 创建DataLoader
-            dataloader = DataLoader(
-                dataset,
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=4,
-                pin_memory=True
-            )
-
-            self.train_data[participant_id] = dataloader
-
-        # 创建测试集DataLoader
-        test_dataset = GTSRBDatasetNumpy(
-            test_images,
-            test_labels,
-            transform=transform_test
-        )
-
-        self.test_data = DataLoader(
-            test_dataset,
-            batch_size=self.test_batch_size,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True
-        )
-
-        print(f"✓ GTSRB数据加载完成")
-
-        # 设置类别数
-        self.num_classes = 43
-
+    
     def _split_train_data(self, train_dataset):
         """
         分割训练数据给各个参与者
         支持IID和Non-IID（Dirichlet分布）
         """
         sample_method = self.config.get('sample_method', 'random')
-
+        
         if sample_method == 'random':
             # IID分割
             self._split_iid(train_dataset)
@@ -392,34 +235,34 @@ class Helper:
             self._split_dirichlet(train_dataset)
         else:
             raise ValueError(f"不支持的分割方法: {sample_method}")
-
+    
     def _split_iid(self, dataset):
         """IID数据分割"""
         total_size = len(dataset)
         indices = list(range(total_size))
         random.shuffle(indices)
-
+        
         # 计算每个参与者的数据量
         samples_per_participant = total_size // self.num_total_participants
-
+        
         for i in range(self.num_total_participants):
             start_idx = i * samples_per_participant
             end_idx = (i + 1) * samples_per_participant if i < self.num_total_participants - 1 else total_size
-
+            
             participant_indices = indices[start_idx:end_idx]
             participant_dataset = Subset(dataset, participant_indices)
-
+            
             self.train_data[i] = DataLoader(
                 participant_dataset,
                 batch_size=self.batch_size,
                 shuffle=True,
                 num_workers=0
             )
-
+    
     def _split_dirichlet(self, dataset):
         """Non-IID数据分割（Dirichlet分布）"""
         alpha = self.config.get('dirichlet_alpha', 0.5)
-
+        
         # 获取所有标签
         if hasattr(dataset, 'targets'):
             labels = np.array(dataset.targets)
@@ -428,30 +271,30 @@ class Helper:
         else:
             # 手动提取标签
             labels = np.array([dataset[i][1] for i in range(len(dataset))])
-
+        
         num_classes = len(np.unique(labels))
-
+        
         # 为每个类别的样本生成索引
         class_indices = [np.where(labels == i)[0] for i in range(num_classes)]
-
+        
         # 为每个参与者分配数据
         participant_indices = [[] for _ in range(self.num_total_participants)]
-
+        
         for c in range(num_classes):
             # 使用Dirichlet分布生成分配比例
             proportions = np.random.dirichlet(
                 np.repeat(alpha, self.num_total_participants)
             )
-
+            
             # 根据比例分配样本
             proportions = (np.cumsum(proportions) * len(class_indices[c])).astype(int)
             proportions = [0] + proportions.tolist()
-
+            
             for i in range(self.num_total_participants):
                 start = proportions[i]
                 end = proportions[i + 1]
                 participant_indices[i].extend(class_indices[c][start:end])
-
+        
         # 创建DataLoader
         for i in range(self.num_total_participants):
             if len(participant_indices[i]) > 0:
@@ -465,7 +308,7 @@ class Helper:
             else:
                 # 如果某个参与者没有分配到数据，给它一些随机样本
                 participant_indices[i] = random.sample(
-                    range(len(dataset)),
+                    range(len(dataset)), 
                     max(1, len(dataset) // self.num_total_participants // 10)
                 )
                 participant_dataset = Subset(dataset, participant_indices[i])
@@ -475,13 +318,13 @@ class Helper:
                     shuffle=True,
                     num_workers=0
                 )
-
+    
     def load_model(self):
         """加载模型"""
         print(f"初始化模型...")
-
+        
         # 根据数据集选择模型
-        if self.dataset.lower() in ['cifar10', 'cifar100', 'gtsrb']:
+        if self.dataset.lower() in ['cifar10', 'cifar100']:
             from models.resnet import ResNet18
             self.global_model = ResNet18(num_classes=self.num_classes)
         elif self.dataset.lower() == 'mnist':
@@ -489,12 +332,12 @@ class Helper:
             self.global_model = self._create_mnist_model()
         else:
             raise ValueError(f"不支持的数据集: {self.dataset}")
-
+        
         # 移动到GPU
         self.global_model = self.global_model.cuda()
-
+        
         print(f"✓ 模型初始化完成: {self.global_model.__class__.__name__}\n")
-
+    
     def _create_mnist_model(self):
         """创建MNIST简单CNN模型"""
         class SimpleCNN(nn.Module):
@@ -506,7 +349,7 @@ class Helper:
                 self.dropout2 = nn.Dropout(0.5)
                 self.fc1 = nn.Linear(9216, 128)
                 self.fc2 = nn.Linear(128, 10)
-
+            
             def forward(self, x):
                 x = self.conv1(x)
                 x = nn.functional.relu(x)
@@ -520,51 +363,51 @@ class Helper:
                 x = self.dropout2(x)
                 x = self.fc2(x)
                 return x
-
+        
         return SimpleCNN()
-
+    
     def config_adversaries(self):
         """配置攻击者"""
         print(f"配置攻击者...")
-
+        
         # 随机选择攻击者
         self.adversary_list = random.sample(
             range(self.num_total_participants),
             self.num_adversaries
         )
-
+        
         print(f"✓ 攻击者配置完成: {self.adversary_list}\n")
-
+    
     def sample_participants(self, epoch):
         """
         采样参与者
-
+        
         Args:
             epoch: 当前轮次
-
+            
         Returns:
             sampled_participants: 采样的参与者ID列表
         """
         # 确保至少有一个攻击者被采样
         available_adversaries = [adv for adv in self.adversary_list]
-
+        
         if len(available_adversaries) > 0:
             # 随机选择一个攻击者
             selected_adversary = random.choice(available_adversaries)
-
+            
             # 从非攻击者中采样剩余参与者
             benign_participants = [
-                i for i in range(self.num_total_participants)
+                i for i in range(self.num_total_participants) 
                 if i not in self.adversary_list
             ]
-
+            
             num_benign = self.num_sampled_participants - 1
             if num_benign > 0:
-                selected_benign = random.sample(benign_participants,
+                selected_benign = random.sample(benign_participants, 
                                                min(num_benign, len(benign_participants)))
             else:
                 selected_benign = []
-
+            
             sampled_participants = [selected_adversary] + selected_benign
         else:
             # 如果没有攻击者，随机采样
@@ -572,66 +415,66 @@ class Helper:
                 range(self.num_total_participants),
                 self.num_sampled_participants
             )
-
+        
         return sampled_participants
-
+    
     def get_lr(self, epoch):
         """
         获取学习率（支持学习率调度）
-
+        
         Args:
             epoch: 当前轮次
-
+            
         Returns:
             lr: 学习率
         """
         lr_method = self.config.get('lr_method', 'constant')
         base_lr = self.config.lr
-
+        
         if lr_method == 'constant':
             return base_lr
-
+        
         elif lr_method == 'linear':
             # 线性衰减
             decay_rate = self.config.get('lr_decay_rate', 0.99)
             return base_lr * (decay_rate ** epoch)
-
+        
         elif lr_method == 'step':
             # 阶梯衰减
             decay_epochs = self.config.get('lr_decay_epochs', [50, 75])
             decay_factor = self.config.get('lr_decay_factor', 0.1)
-
+            
             lr = base_lr
             for decay_epoch in decay_epochs:
                 if epoch >= decay_epoch:
                     lr *= decay_factor
             return lr
-
+        
         elif lr_method == 'cosine':
             # 余弦退火
             import math
             return base_lr * 0.5 * (1 + math.cos(math.pi * epoch / self.epochs))
-
+        
         else:
             return base_lr
-
+    
     def test_model(self, model=None):
         """
         测试模型准确率
-
+        
         Args:
             model: 要测试的模型（默认使用全局模型）
-
+            
         Returns:
             accuracy: 准确率（百分比）
         """
         if model is None:
             model = self.global_model
-
+        
         model.eval()
         correct = 0
         total = 0
-
+        
         with torch.no_grad():
             for inputs, labels in self.test_data:
                 inputs, labels = inputs.cuda(), labels.cuda()
@@ -639,16 +482,16 @@ class Helper:
                 _, predicted = outputs.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
-
+        
         model.train()
         accuracy = 100.0 * correct / total if total > 0 else 0
         return accuracy
-
+    
     @property
     def target_class(self):
         """获取目标类别"""
         return self.config.get('target_class', 0)
-
+    
     @property
     def save_every(self):
         """获取保存频率"""
@@ -658,7 +501,7 @@ class Helper:
 if __name__ == '__main__':
     # 测试代码
     print("测试Helper模块\n")
-
+    
     # 创建测试配置
     test_config = {
         'dataset': 'cifar10',
@@ -679,34 +522,34 @@ if __name__ == '__main__':
         'retrain_times': 2,
         'attacker_retrain_times': 2
     }
-
+    
     # 创建Helper
     helper = Helper(test_config)
-
+    
     # 加载数据
     helper.load_data()
-
+    
     # 加载模型
     helper.load_model()
-
+    
     # 配置攻击者
     helper.config_adversaries()
-
+    
     # 测试采样
     print("\n测试参与者采样:")
     for i in range(3):
         sampled = helper.sample_participants(i)
         print(f"  Epoch {i}: {sampled}")
-
+    
     # 测试学习率
     print("\n测试学习率调度:")
     for epoch in [0, 25, 50, 75, 99]:
         lr = helper.get_lr(epoch)
         print(f"  Epoch {epoch}: LR = {lr:.6f}")
-
+    
     # 测试模型
     print("\n测试模型准确率:")
     acc = helper.test_model()
     print(f"  初始准确率: {acc:.2f}%")
-
+    
     print("\n✓ Helper模块测试完成")

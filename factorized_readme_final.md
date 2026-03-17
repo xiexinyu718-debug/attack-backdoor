@@ -571,9 +571,10 @@ visualization:
 ```python
 # custom_experiment.py
 import sys
+
 sys.path.append("../")
 import yaml
-from fl_utils.helper import Helper
+from helper import Helper
 from fl_utils.factorized_attacker import FactorizedAttacker
 from fl_utils.evaluation import FactorizedAttackEvaluator
 
