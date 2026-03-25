@@ -1,449 +1,501 @@
 """
-防御机制测试脚本
-评估因子化触发器攻击在各种防御机制下的表现
+test_defenses.py  (v4-compatible)
+=================================
+Tests the enhanced factorized attack (FSA + LWMP) against all defense mechanisms.
+Uses the EXACT same attack pipeline as train_enhanced_attack.py v4.
 
-使用方法:
-    python test_defenses.py --params configs/tmp.yaml --defense krum
-    python test_defenses.py --params configs/tmp.yaml --test_all
+Usage:
+    # From project root:
+    python defense_test_framework/test_defenses.py --params configs/defense_test.yaml --test_all --gpu 0
+
+    # Or from inside defense_test_framework/:
+    cd defense_test_framework
+    python test_defenses.py --params ../configs/defense_test.yaml --test_all --gpu 0
+
+    # Single defense:
+    python defense_test_framework/test_defenses.py --params configs/defense_test.yaml --defense krum --gpu 0
+
+    # Quick test (fewer epochs):
+    python defense_test_framework/test_defenses.py --params configs/defense_test.yaml --test_all --epochs 30
 """
+import os, sys
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+import matplotlib
+matplotlib.use('Agg')
 
-import os
-import sys
-import argparse
-import yaml
-import torch
-import numpy as np
-import random
-import copy
-import json
+# Handle import paths: works whether run from project root or from defense_test_framework/
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_this_dir) if os.path.basename(_this_dir) == 'defense_test_framework' else _this_dir
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+
+import argparse, yaml, torch, torch.nn as nn
+import numpy as np, random, copy, json
 from datetime import datetime
 
-# 导入模块
-# 注意：确保导入项目的helper，而不是第三方库的helper
-import os
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir) if 'defense_test_framework' in current_dir else current_dir
-sys.path.insert(0, project_root)
-
-# 现在可以安全导入
-try:
-    from helper import Helper
-except ImportError:
-    # 如果还是失败，尝试直接导入
-    import importlib.util
-    helper_path = os.path.join(project_root, 'helper.py')
-    spec = importlib.util.spec_from_file_location("helper", helper_path)
-    helper_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(helper_module)
-    Helper = helper_module.Helper
-
+from helper import Helper
 from fl_utils.factorized_attacker import FactorizedAttacker
-from fl_utils.task_separation import create_trainer
 from fl_utils.evaluation import FactorizedAttackEvaluator
+from fl_utils.enhanced_poisoning import create_enhanced_trainer
 from fl_defenses import create_defense
 
 
 def set_seed(seed):
-    """设置随机种子"""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
-def train_benign_client(helper, participant_id, model, epoch):
-    """训练良性客户端"""
-    import torch.nn as nn
+def _cfg(config, key, default=None):
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
 
+
+# -----------------------------------------------------------------------
+# Training functions — identical to train_enhanced_attack.py v4
+# -----------------------------------------------------------------------
+
+def train_benign_client(helper, pid, model, epoch):
     lr = helper.get_lr(epoch)
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=lr,
-        momentum=helper.config.momentum,
-        weight_decay=helper.config.decay
-    )
-
+    opt = torch.optim.SGD(model.parameters(), lr=lr,
+                          momentum=getattr(helper.config, "momentum", 0.9),
+                          weight_decay=getattr(helper.config, "decay", 5e-4))
     model.train()
-    total_loss = 0.0
-    correct = 0
-    total_samples = 0
-
-    for _ in range(helper.config.retrain_times):
-        for inputs, labels in helper.train_data[participant_id]:
-            inputs, labels = inputs.cuda(), labels.cuda()
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = nn.functional.cross_entropy(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            _, predicted = outputs.max(1)
-            correct += predicted.eq(labels).sum().item()
-            total_samples += inputs.shape[0]
-
-    return model
+    tl = cor = ts = 0
+    for _ in range(getattr(helper.config, "retrain_times", 2)):
+        for x, y in helper.train_data[pid]:
+            x, y = x.cuda(), y.cuda()
+            opt.zero_grad(); o = model(x)
+            loss = nn.functional.cross_entropy(o, y)
+            loss.backward(); opt.step()
+            tl += loss.item(); cor += o.max(1)[1].eq(y).sum().item(); ts += x.size(0)
+    nb = len(helper.train_data[pid]) * getattr(helper.config, "retrain_times", 2)
+    return model, {"loss": tl/max(nb,1), "accuracy": 100.*cor/max(ts,1), "total_samples": ts}
 
 
-def train_malicious_client(helper, participant_id, model, epoch, attacker, trainer):
-    """训练恶意客户端"""
-    adversary_id = helper.adversary_list.index(participant_id)
+def _compute_l2(model, ref_model):
+    s = 0.0
+    with torch.no_grad():
+        for (_, p1), (_, p2) in zip(model.named_parameters(), ref_model.named_parameters()):
+            s += torch.sum((p1.data - p2.data)**2).item()
+    return np.sqrt(s)
 
-    # 分配因子组合
-    if epoch % attacker.rotation_frequency == 0:
-        attacker.assign_factor_combination(adversary_id, epoch)
 
-    # 创建优化器
+def _get_poisoned_batch(helper, attacker, adv_id, epoch):
+    for x, y in helper.test_data:
+        x, y = x.cuda(), y.cuda()
+        px, py, _ = attacker.poison_input_with_task_separation(
+            x, y, adv_id, epoch, eval_mode=True)
+        return (px, py)
+    return None
+
+
+def sample_participants_fixed(helper, epoch):
+    n_samp = helper.num_sampled_participants
+    n_mal = min(_cfg(helper.config, "num_malicious_per_round",
+                     len(helper.adversary_list)),
+                len(helper.adversary_list), n_samp)
+    sel_mal = random.sample(helper.adversary_list, n_mal)
+    benign_pool = [i for i in range(helper.num_total_participants)
+                   if i not in helper.adversary_list]
+    sel_ben = random.sample(benign_pool, min(n_samp - n_mal, len(benign_pool)))
+    out = sel_mal + sel_ben
+    random.shuffle(out)
+    return out
+
+
+def train_malicious_client(helper, pid, model, epoch, attacker, enh):
+    adv_id = helper.adversary_list.index(pid)
+
+    # Rotation — compatible with both old and new attacker
+    if hasattr(attacker, 'register_participation'):
+        attacker.register_participation(adv_id, epoch)
+    else:
+        if epoch % attacker.rotation_frequency == 0:
+            attacker.assign_factor_combination(adv_id, epoch)
+
+    pb = _get_poisoned_batch(helper, attacker, adv_id, epoch)
+    enh.prepare_round(model, helper.train_data[pid], poisoned_batch=pb, epoch=epoch)
+
     lr = helper.get_lr(epoch)
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=lr,
-        momentum=helper.config.momentum,
-        weight_decay=helper.config.decay
-    )
+    opt = torch.optim.SGD(model.parameters(), lr=lr,
+                          momentum=getattr(helper.config, "momentum", 0.9),
+                          weight_decay=getattr(helper.config, "decay", 5e-4))
 
-    # 使用任务分离训练
-    for _ in range(helper.config.attacker_retrain_times):
-        trainer.train_epoch(
-            model, optimizer,
-            helper.train_data[participant_id],
-            attacker, adversary_id, epoch
-        )
+    retrain = getattr(helper.config, "attacker_retrain_times", 3)
+    all_s = []
+    for _ in range(retrain):
+        all_s.append(enh.train_epoch(model, opt, helper.train_data[pid],
+                                     attacker, adv_id, epoch))
 
-    return model
-
-
-def test_with_defense(helper, attacker, trainer, defense, num_epochs=50):
-    """
-    使用指定防御测试攻击效果
-
-    Args:
-        helper: Helper对象
-        attacker: FactorizedAttacker实例
-        trainer: 任务分离训练器
-        defense: 防御实例
-        num_epochs: 测试轮数
-
-    Returns:
-        results: 测试结果
-    """
-    print(f"\n{'='*70}")
-    print(f"测试防御: {defense.name}")
-    print(f"{'='*70}")
-
-    # 初始化评估器
-    evaluator = FactorizedAttackEvaluator(helper, attacker)
-
-    # 存储结果
-    evaluation_history = []
-
-    # 训练循环
-    for epoch in range(num_epochs):
-        if epoch % 10 == 0:
-            print(f"\nEpoch {epoch}/{num_epochs}")
-
-        # 采样参与者
-        sampled_participants = helper.sample_participants(epoch)
-        malicious_in_round = [p for p in sampled_participants if p in helper.adversary_list]
-
-        # 本地训练
-        local_models = {}
-        for participant_id in sampled_participants:
-            local_model = copy.deepcopy(helper.global_model)
-
-            if participant_id in helper.adversary_list:
-                local_model = train_malicious_client(
-                    helper, participant_id, local_model, epoch, attacker, trainer
-                )
-            else:
-                local_model = train_benign_client(
-                    helper, participant_id, local_model, epoch
-                )
-
-            local_models[participant_id] = local_model
-
-        # 使用防御机制聚合
-        aggregated_state = defense.aggregate(
-            helper.global_model, local_models, sampled_participants
-        )
-
-        # 更新全局模型
-        helper.global_model.load_state_dict(aggregated_state)
-
-        # 定期评估
-        if epoch % 10 == 0 or epoch == num_epochs - 1:
-            results = evaluator.comprehensive_evaluation(helper.global_model, epoch)
-            results['epoch'] = epoch
-            evaluation_history.append(results)
-
-            print(f"  主任务准确率: {results['main_accuracy']:.2f}%")
-            print(f"  平均ASR: {results['average_asr']:.2f}%")
-
-    # 返回最终结果
-    final_results = evaluation_history[-1]
-
-    return {
-        'defense_name': defense.name,
-        'final_main_accuracy': final_results['main_accuracy'],
-        'final_asr': final_results['average_asr'],
-        'final_individual_asr': final_results['individual_asr'],
-        'evaluation_history': evaluation_history,
+    enh.finalise_round(model)
+    return model, {
+        "avg_loss": np.mean([s["avg_loss"] for s in all_s]),
+        "accuracy": all_s[-1]["accuracy"],
+        "poisoned_samples": sum(s["poisoned_samples"] for s in all_s),
+        "total_samples": all_s[-1]["total_samples"],
     }
 
 
-def test_all_defenses(helper, attacker, trainer, num_epochs=50):
-    """测试所有防御机制"""
+# -----------------------------------------------------------------------
+# Backward-compatible client_models dict
+# -----------------------------------------------------------------------
+
+class ClientModelsCompat(dict):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._ordered = []
+
+    def set_with_order(self, pid, model):
+        self[pid] = model
+        self._ordered.append(pid)
+
+    def __getitem__(self, key):
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            if isinstance(key, int) and 0 <= key < len(self._ordered):
+                return super().__getitem__(self._ordered[key])
+            raise
+
+
+# -----------------------------------------------------------------------
+# Core: test one defense
+# -----------------------------------------------------------------------
+
+def test_with_defense(helper, attacker, enh_trainer, defense, num_epochs):
+    """
+    Run FL with a specific defense aggregation for num_epochs.
+    Returns evaluation history and final metrics.
+    """
     print(f"\n{'='*70}")
-    print(f"测试所有防御机制")
+    print(f"Testing defense: {defense.name}  ({num_epochs} epochs)")
     print(f"{'='*70}")
 
-    # 定义要测试的防御
+    evaluator = FactorizedAttackEvaluator(helper, attacker)
+    eval_history = []
+
+    for epoch in range(num_epochs):
+        sampled = sample_participants_fixed(helper, epoch)
+        mal_ids = [p for p in sampled if p in helper.adversary_list]
+        ben_ids = [p for p in sampled if p not in helper.adversary_list]
+
+        if epoch % 10 == 0:
+            print(f"\n  Epoch {epoch}/{num_epochs}  (mal={len(mal_ids)}, ben={len(ben_ids)})")
+
+        helper.client_models = ClientModelsCompat()
+        local_models = {}
+
+        # Phase 1: benign
+        benign_l2s = []
+        for pid in ben_ids:
+            lm = copy.deepcopy(helper.global_model)
+            lm, _ = train_benign_client(helper, pid, lm, epoch)
+            local_models[pid] = lm
+            helper.client_models.set_with_order(pid, lm)
+            benign_l2s.append(_compute_l2(lm, helper.global_model))
+
+        avg_ben_l2 = np.mean(benign_l2s) if benign_l2s else 0.0
+        enh_trainer.set_benign_reference_norm(avg_ben_l2)
+
+        # Phase 2: malicious
+        for pid in mal_ids:
+            lm = copy.deepcopy(helper.global_model)
+            lm, _ = train_malicious_client(helper, pid, lm, epoch, attacker, enh_trainer)
+            local_models[pid] = lm
+            helper.client_models.set_with_order(pid, lm)
+
+        # ★ Use defense aggregation instead of plain FedAvg
+        aggregated_state = defense.aggregate(
+            helper.global_model, local_models, list(local_models.keys())
+        )
+        helper.global_model.load_state_dict(aggregated_state)
+
+        # Evaluate periodically
+        eval_freq = max(num_epochs // 10, 5)
+        if epoch % eval_freq == 0 or epoch == num_epochs - 1:
+            results = evaluator.comprehensive_evaluation(helper.global_model, epoch)
+            results['epoch'] = epoch
+            eval_history.append(results)
+
+            if epoch % 10 == 0:
+                print(f"    Acc={results['main_accuracy']:.2f}%  ASR={results['average_asr']:.2f}%")
+
+    final = eval_history[-1] if eval_history else {}
+    return {
+        'defense_name': defense.name,
+        'final_main_accuracy': final.get('main_accuracy', 0),
+        'final_asr': final.get('average_asr', 0),
+        'final_individual_asr': final.get('individual_asr', {}),
+        'final_stealthiness': final.get('stealthiness', {}),
+        'evaluation_history': eval_history,
+    }
+
+
+# -----------------------------------------------------------------------
+# Test all defenses
+# -----------------------------------------------------------------------
+
+def test_all_defenses(helper, attacker, enh_trainer, num_epochs, config):
+    """Test all defense mechanisms, resetting model for each."""
+
     defense_configs = [
-        {'name': 'fedavg', 'params': {}},
-        {'name': 'krum', 'params': {'krum_num_selected': 5}},
-        {'name': 'trimmed_mean', 'params': {'trimmed_mean_beta': 0.1}},
-        {'name': 'median', 'params': {}},
+        {'name': 'fedavg',        'params': {}},
+        {'name': 'krum',          'params': {'krum_num_selected': 5}},
+        {'name': 'trimmed_mean',  'params': {'trimmed_mean_beta': 0.1}},
+        {'name': 'median',        'params': {}},
         {'name': 'norm_clipping', 'params': {'clip_threshold': 10.0}},
-        {'name': 'weak_dp', 'params': {'dp_noise_scale': 0.001}},
-        {'name': 'foolsgold', 'params': {}},
+        {'name': 'weak_dp',       'params': {'dp_noise_scale': 0.001}},
+        {'name': 'foolsgold',     'params': {}},
     ]
 
     all_results = {}
+    # Save initial model state to reset between defenses
+    initial_state = copy.deepcopy(helper.global_model.state_dict())
 
-    for defense_config in defense_configs:
-        # 更新配置
-        config_dict = vars(helper.config)
-        config_dict.update(defense_config['params'])
+    for dc in defense_configs:
+        print(f"\n{'#'*70}")
+        print(f"# Defense: {dc['name'].upper()}")
+        print(f"{'#'*70}")
 
-        # 创建防御
-        defense = create_defense(defense_config['name'], helper.config)
+        # Reset model to same starting point
+        helper.global_model.load_state_dict(copy.deepcopy(initial_state))
 
-        # 重新初始化模型（确保每个防御从相同起点开始）
-        helper.load_model()
+        # Merge defense-specific params into config
+        for k, v in dc['params'].items():
+            if isinstance(helper.config, dict):
+                helper.config[k] = v
+            else:
+                setattr(helper.config, k, v)
 
-        # 测试
-        results = test_with_defense(helper, attacker, trainer, defense, num_epochs)
-        all_results[defense_config['name']] = results
+        defense = create_defense(dc['name'], helper.config)
+        results = test_with_defense(helper, attacker, enh_trainer, defense, num_epochs)
+        all_results[dc['name']] = results
 
     return all_results
 
 
+# -----------------------------------------------------------------------
+# Report generation
+# -----------------------------------------------------------------------
+
 def print_comparison_table(all_results):
-    """打印对比表格"""
-    print(f"\n{'='*70}")
-    print(f"防御机制对比结果")
-    print(f"{'='*70}\n")
+    baseline_asr = all_results.get('fedavg', {}).get('final_asr', 0)
+    baseline_acc = all_results.get('fedavg', {}).get('final_main_accuracy', 0)
 
-    # 表头
-    print(f"{'防御机制':<20} {'主任务准确率':<15} {'平均ASR':<15} {'ASR下降':<15}")
-    print(f"{'-'*70}")
+    print(f"\n{'='*80}")
+    print(f"DEFENSE COMPARISON RESULTS")
+    print(f"{'='*80}")
+    print(f"{'Defense':<20} {'Main Acc':>10} {'ASR':>10} {'ASR Drop':>10} {'Drop %':>10} {'Effect':>10}")
+    print(f"{'-'*80}")
 
-    # 基准（无防御）
+    for name in ['fedavg', 'krum', 'trimmed_mean', 'median',
+                  'norm_clipping', 'weak_dp', 'foolsgold']:
+        if name not in all_results:
+            continue
+        r = all_results[name]
+        acc = r['final_main_accuracy']
+        asr = r['final_asr']
+        drop = baseline_asr - asr
+        drop_pct = (drop / baseline_asr * 100) if baseline_asr > 0 else 0
+
+        if drop_pct > 50:     eff = "STRONG"
+        elif drop_pct > 30:   eff = "MODERATE"
+        elif drop_pct > 15:   eff = "WEAK"
+        else:                 eff = "NONE"
+
+        print(f"{r['defense_name']:<20} {acc:>10.2f} {asr:>10.2f} {drop:>10.2f} {drop_pct:>9.1f}% {eff:>10}")
+
+    print(f"{'='*80}")
+
+
+def generate_report(all_results, config, save_path):
     baseline_asr = all_results.get('fedavg', {}).get('final_asr', 0)
 
-    # 打印每个防御的结果
-    for defense_name in ['fedavg', 'krum', 'trimmed_mean', 'median',
-                         'norm_clipping', 'weak_dp', 'foolsgold']:
-        if defense_name not in all_results:
-            continue
-
-        result = all_results[defense_name]
-        main_acc = result['final_main_accuracy']
-        asr = result['final_asr']
-        asr_drop = baseline_asr - asr
-
-        print(f"{result['defense_name']:<20} {main_acc:<15.2f} {asr:<15.2f} {asr_drop:<15.2f}")
-
-    print(f"{'='*70}\n")
-
-
-def generate_defense_report(all_results, save_path):
-    """生成防御测试报告"""
     report = {
-        'test_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'results': all_results,
-        'summary': {}
+        'test_date': datetime.now().isoformat(),
+        'version': 'v4-enhanced',
+        'attack_config': {
+            'k_of_m': f"{config.get('k_of_m_k', 2)}-of-{config.get('k_of_m_m', 3)}",
+            'num_adversaries': config.get('num_adversaries', 4),
+            'num_malicious_per_round': config.get('num_malicious_per_round', 2),
+            'bkd_ratio': config.get('bkd_ratio', 0.20),
+            'lambda_align': config.get('lambda_align', 0.3),
+            'lwmp_strategy': config.get('lwmp_strategy', 'auto'),
+            'norm_projection': config.get('norm_projection', True),
+        },
+        'results': {},
+        'summary': {},
     }
 
-    # 计算摘要统计
-    baseline_asr = all_results.get('fedavg', {}).get('final_asr', 0)
-
-    for defense_name, result in all_results.items():
-        report['summary'][defense_name] = {
-            'main_accuracy': result['final_main_accuracy'],
-            'asr': result['final_asr'],
-            'asr_drop': baseline_asr - result['final_asr'],
-            'asr_drop_percentage': ((baseline_asr - result['final_asr']) / baseline_asr * 100) if baseline_asr > 0 else 0
+    for name, r in all_results.items():
+        asr = r['final_asr']
+        report['results'][name] = {
+            'defense_name': r['defense_name'],
+            'main_accuracy': r['final_main_accuracy'],
+            'asr': asr,
+            'individual_asr': r.get('final_individual_asr', {}),
+            'stealthiness': r.get('final_stealthiness', {}),
+        }
+        report['summary'][name] = {
+            'main_accuracy': r['final_main_accuracy'],
+            'asr': asr,
+            'asr_drop': baseline_asr - asr,
+            'asr_drop_percentage': ((baseline_asr - asr) / baseline_asr * 100) if baseline_asr > 0 else 0,
         }
 
-    # 保存报告
     with open(save_path, 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    print(f"✓ 防御测试报告已保存: {save_path}")
+    print(f"\nReport saved: {save_path}")
+    return report
 
 
-def visualize_defense_results(all_results, save_dir='./defense_visualizations'):
-    """可视化防御测试结果"""
+def visualize_results(all_results, save_dir='./defense_visualizations'):
     import matplotlib.pyplot as plt
-
     os.makedirs(save_dir, exist_ok=True)
 
-    # 1. ASR对比柱状图
-    fig, ax = plt.subplots(figsize=(12, 6))
-
-    defense_names = []
-    asrs = []
-    main_accs = []
-
-    for defense_name in ['fedavg', 'krum', 'trimmed_mean', 'median',
-                         'norm_clipping', 'weak_dp', 'foolsgold']:
-        if defense_name not in all_results:
+    names, asrs, accs = [], [], []
+    for name in ['fedavg','krum','trimmed_mean','median','norm_clipping','weak_dp','foolsgold']:
+        if name not in all_results:
             continue
+        r = all_results[name]
+        names.append(r['defense_name'])
+        asrs.append(r['final_asr'])
+        accs.append(r['final_main_accuracy'])
 
-        result = all_results[defense_name]
-        defense_names.append(result['defense_name'])
-        asrs.append(result['final_asr'])
-        main_accs.append(result['final_main_accuracy'])
+    fig, ax = plt.subplots(figsize=(12, 6))
+    x = np.arange(len(names))
+    w = 0.35
+    b1 = ax.bar(x - w/2, asrs, w, label='ASR', color='indianred', alpha=0.7)
+    b2 = ax.bar(x + w/2, accs, w, label='Main Accuracy', color='steelblue', alpha=0.7)
 
-    x = np.arange(len(defense_names))
-    width = 0.35
+    for bar in b1:
+        ax.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                f'{bar.get_height():.1f}%', ha='center', va='bottom', fontsize=9)
+    for bar in b2:
+        ax.text(bar.get_x() + bar.get_width()/2., bar.get_height(),
+                f'{bar.get_height():.1f}%', ha='center', va='bottom', fontsize=9)
 
-    bars1 = ax.bar(x - width/2, asrs, width, label='ASR', color='indianred', alpha=0.7)
-    bars2 = ax.bar(x + width/2, main_accs, width, label='Main Accuracy', color='steelblue', alpha=0.7)
-
-    # 标注数值
-    for bar in bars1:
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height,
-               f'{height:.1f}%', ha='center', va='bottom', fontsize=9)
-
-    for bar in bars2:
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height,
-               f'{height:.1f}%', ha='center', va='bottom', fontsize=9)
-
-    ax.set_xlabel('Defense Mechanism', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
-    ax.set_title('Defense Mechanisms Comparison', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Defense', fontsize=12)
+    ax.set_ylabel('Percentage (%)', fontsize=12)
+    ax.set_title('Enhanced Attack (v4) vs Defense Mechanisms', fontsize=14, fontweight='bold')
     ax.set_xticks(x)
-    ax.set_xticklabels(defense_names, rotation=15, ha='right')
+    ax.set_xticklabels(names, rotation=15, ha='right')
     ax.legend()
     ax.grid(True, alpha=0.3, axis='y')
-
     plt.tight_layout()
     plt.savefig(f'{save_dir}/defense_comparison.png', dpi=150, bbox_inches='tight')
-    print(f"✓ 保存对比图: {save_dir}/defense_comparison.png")
+    print(f"  Saved: {save_dir}/defense_comparison.png")
     plt.close()
 
-    # 2. 训练过程曲线
+    # Training curves per defense
     fig, axes = plt.subplots(2, 4, figsize=(20, 10))
     axes = axes.flatten()
-
-    for idx, defense_name in enumerate(['fedavg', 'krum', 'trimmed_mean', 'median',
-                                        'norm_clipping', 'weak_dp', 'foolsgold']):
-        if defense_name not in all_results:
+    idx = 0
+    for name in ['fedavg','krum','trimmed_mean','median','norm_clipping','weak_dp','foolsgold']:
+        if name not in all_results or idx >= 7:
+            continue
+        r = all_results[name]
+        hist = r.get('evaluation_history', [])
+        if not hist:
+            idx += 1
             continue
 
-        result = all_results[defense_name]
-        history = result['evaluation_history']
-
-        epochs = [h['epoch'] for h in history]
-        main_accs = [h['main_accuracy'] for h in history]
-        asrs = [h['average_asr'] for h in history]
+        eps = [h['epoch'] for h in hist]
+        ma = [h['main_accuracy'] for h in hist]
+        asr = [h['average_asr'] for h in hist]
 
         ax = axes[idx]
-        ax.plot(epochs, main_accs, 'b-o', label='Main Acc', linewidth=2, markersize=4)
-        ax.plot(epochs, asrs, 'r-o', label='ASR', linewidth=2, markersize=4)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Percentage (%)')
-        ax.set_title(result['defense_name'], fontweight='bold')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.plot(eps, ma, 'b-o', label='Acc', markersize=3, linewidth=1.5)
+        ax.plot(eps, asr, 'r-o', label='ASR', markersize=3, linewidth=1.5)
+        ax.set_title(r['defense_name'], fontweight='bold')
+        ax.set_xlabel('Epoch'); ax.set_ylabel('%')
+        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+        idx += 1
 
-    # 隐藏未使用的子图
-    for idx in range(len(all_results), 8):
-        axes[idx].set_visible(False)
+    for i in range(idx, 8):
+        axes[i].set_visible(False)
 
-    plt.suptitle('Training Progress Under Different Defenses', fontsize=16, fontweight='bold')
+    plt.suptitle('Training under each defense', fontsize=16, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(f'{save_dir}/defense_training_curves.png', dpi=150, bbox_inches='tight')
-    print(f"✓ 保存训练曲线: {save_dir}/defense_training_curves.png")
+    plt.savefig(f'{save_dir}/defense_curves.png', dpi=150, bbox_inches='tight')
+    print(f"  Saved: {save_dir}/defense_curves.png")
     plt.close()
 
 
+# -----------------------------------------------------------------------
+# main
+# -----------------------------------------------------------------------
+
 def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(description='测试因子化攻击在防御机制下的表现')
-    parser.add_argument('--params', type=str, required=True, help='配置文件路径')
-    parser.add_argument('--gpu', type=int, default=0, help='GPU设备ID')
+    parser = argparse.ArgumentParser(description='Test enhanced v4 attack against defenses')
+    parser.add_argument('--params', type=str, required=True)
+    parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--defense', type=str, default=None,
-                       help='测试单个防御 (fedavg/krum/trimmed_mean/median/norm_clipping/weak_dp/foolsgold)')
-    parser.add_argument('--test_all', action='store_true', help='测试所有防御')
-    parser.add_argument('--epochs', type=int, default=50, help='测试轮数')
-    parser.add_argument('--seed', type=int, default=None, help='随机种子')
+                        help='Single defense: fedavg/krum/trimmed_mean/median/norm_clipping/weak_dp/foolsgold')
+    parser.add_argument('--test_all', action='store_true')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Override epoch count (default: from config)')
+    parser.add_argument('--seed', type=int, default=None)
     args = parser.parse_args()
 
-    # 设置GPU
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
-        print(f"使用GPU: {args.gpu}")
+        print(f"GPU: {args.gpu}")
 
-    # 加载配置
     with open(args.params, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
-    # 设置随机种子
-    seed = args.seed if args.seed is not None else config.get('seed', 0)
+    num_epochs = args.epochs if args.epochs else config.get('epochs', 80)
+    seed = args.seed if args.seed else config.get('seed', 42)
     set_seed(seed)
 
-    # 初始化系统
-    print(f"\n初始化系统...")
+    # Init
+    print(f"\nInitialising system...")
     helper = Helper(config)
     helper.load_data()
     helper.load_model()
     helper.config_adversaries()
 
-    # 初始化攻击器和训练器
     attacker = FactorizedAttacker(helper)
-    trainer = create_trainer(helper.config, adaptive=True)
+    enh_trainer = create_enhanced_trainer(config, helper.global_model)
 
-    # 测试防御
+    n_mal = config.get('num_malicious_per_round',
+                       min(config.get('num_adversaries', 4),
+                           config.get('num_sampled_participants', 10)))
+
+    print(f"\n  Attack: Enhanced v4 (FSA + LWMP)")
+    print(f"  Mal/round: {n_mal}/{config.get('num_sampled_participants', 10)}")
+    print(f"  Test epochs: {num_epochs}")
+
     if args.test_all:
-        # 测试所有防御
-        all_results = test_all_defenses(helper, attacker, trainer, args.epochs)
-
-        # 打印对比表格
+        all_results = test_all_defenses(helper, attacker, enh_trainer, num_epochs, config)
         print_comparison_table(all_results)
-
-        # 生成报告
-        report_path = './defense_test_report.json'
-        generate_defense_report(all_results, report_path)
-
-        # 可视化
-        visualize_defense_results(all_results)
+        report_path = config.get('results_dir', '.') + '/defense_test_report.json'
+        os.makedirs(os.path.dirname(report_path) or '.', exist_ok=True)
+        generate_report(all_results, config, report_path)
+        visualize_results(all_results,
+                          save_dir=config.get('results_dir', './defense_visualizations'))
 
     elif args.defense:
-        # 测试单个防御
+        helper.load_model()  # fresh model
         defense = create_defense(args.defense, helper.config)
-        results = test_with_defense(helper, attacker, trainer, defense, args.epochs)
+        results = test_with_defense(helper, attacker, enh_trainer, defense, num_epochs)
 
         print(f"\n{'='*70}")
-        print(f"最终结果")
+        print(f"Defense: {results['defense_name']}")
+        print(f"Main accuracy: {results['final_main_accuracy']:.2f}%")
+        print(f"ASR: {results['final_asr']:.2f}%")
         print(f"{'='*70}")
-        print(f"防御机制: {results['defense_name']}")
-        print(f"主任务准确率: {results['final_main_accuracy']:.2f}%")
-        print(f"平均ASR: {results['final_asr']:.2f}%")
-        print(f"{'='*70}")
-
     else:
-        print("错误: 请指定 --defense 或 --test_all")
-        return
+        print("Error: specify --defense <name> or --test_all")
 
-    print(f"\n✓ 测试完成！")
+    print(f"\nDone!")
 
 
 if __name__ == '__main__':

@@ -1,131 +1,99 @@
-# 防御机制测试配置
-# 专门用于测试因子化攻击在各种防御下的表现
+# ============================================================================
+# Defense Test Config — Fast Convergence (200ep, target 90%+ acc)
+# ============================================================================
+# Problem: 200ep cosine decays LR too early → acc caps at 87%.
+#
+# Three changes to accelerate convergence WITHOUT touching attack params:
+#   1. lr_method: step [120,170] — keeps LR=0.08 for 120 full epochs
+#      (cosine was already at 0.019 by ep100)
+#   2. lr: 0.06→0.08 — higher base LR for faster feature learning
+#   3. retrain_times: 2→3 — each client trains 50% more per round
+#
+# These only affect convergence speed. Attack mechanism is unchanged:
+#   same FSA, LWMP, norm_projection, bkd_ratio, separation_weight.
+#
+# Expected: Acc ~90-91%, ASR ~99%+, same wall time as 200ep cosine.
+# ============================================================================
 
-# ============= 基础配置 =============
 dataset: 'cifar10'
 seed: 42
-epochs: 50  # 防御测试通常不需要200轮
-poison_epochs: 50
+epochs: 200
 poison_start_epoch: 0
+poison_stop_epoch: 200
+poison_epochs: 200
 
-# ============= 联邦学习配置 =============
+# ============= FL — identical to v4 =============
 num_total_participants: 100
 num_sampled_participants: 10
-num_adversaries: 3
+num_adversaries: 4
+num_malicious_per_round: 2
 sample_method: 'random'
 dirichlet_alpha: 0.9
 
-# ============= 训练配置 =============
-lr: 0.005
-target_lr: 0.01
-lr_method: 'step'
-lr_decay_epochs: [25, 40]  # 调整为50轮
-lr_decay_factor: 0.1
-
+# ============= Training — convergence optimised =============
+lr: 0.08                           # ★ 0.06→0.08 (faster feature learning)
+target_lr: 0.08
+lr_method: 'step'                  # ★ cosine→step (keeps LR high for 120ep)
+lr_decay_epochs: [120, 170]        # ★ decay at ep120 and ep170
+lr_decay_factor: 0.1               # ★ 10x reduction each step
 momentum: 0.9
-decay: 0.001
+decay: 0.0005
 batch_size: 64
 test_batch_size: 1024
-retrain_times: 2
-attacker_retrain_times: 2
+retrain_times: 3                   # ★ 2→3 (50% more local training per round)
+attacker_retrain_times: 3
 
-# ============= 聚合方法配置 =============
-agg_method: 'avg'  # 这个会被防御机制覆盖
+# ============= Aggregation =============
+agg_method: 'avg'
 clip_factor: 1
 
-# ============= 因子化攻击配置 =============
+# ============= Factorised Trigger — identical to v4 =============
 attacker_method: 'factorized'
-
-# k-of-m规则
 k_of_m_k: 2
 k_of_m_m: 3
-
-# 动态强度
-initial_intensity: 0.12
+initial_intensity: 0.15
 final_intensity: 0.55
-
-# 任务分离
-task_separation_weight: 0.35
-
-# 轮换策略
+task_separation_weight: 0.40
 rotation_strategy: 'adversary_specific'
 rotation_frequency: 1
-
-# 攻击目标
 target_class: 2
-bkd_ratio: 0.18
+bkd_ratio: 0.20
 
-# 评估频率
+# ============= Enhanced Attack (FSA + LWMP) — identical to v4 =============
+lambda_align: 0.3
+lambda_align_start: 0.0
+fsa_warmup_epochs: 80
+fsa_distance: 'cosine'
+fsa_momentum: 0.9
+fsa_feature_layer: null
+
+lambda_poison: 0.0
+lwmp_strategy: 'auto'
+lwmp_top_k_ratio: 0.4
+lwmp_critical_scale: 1.2
+lwmp_noncritical_scale: 0.7
+lwmp_max_l2_ratio: 1.5
+
+norm_projection: true
+target_l2_ratio: 1.0
+adaptive_separation: true
+sep_asr_low: 0.70
+sep_asr_high: 0.90
+
+# ============= Defense parameters =============
+krum_num_selected: 5
+trimmed_mean_beta: 0.1
+clip_threshold: 10.0
+dp_noise_scale: 0.001
+
+# ============= Evaluation =============
 eval_freq: 10
 
-# ============= 防御机制参数 =============
+# ============= Output =============
+environment_name: 'defense_test_v4_fast'
+save_model: false
+save_on_epochs: []
+results_dir: './results/defense_test_v4_fast'
 
-# Krum防御
-krum_num_selected: 5  # Multi-Krum：选择前5个模型
-
-# Trimmed Mean防御
-trimmed_mean_beta: 0.1  # 修剪10%的极端值（每端）
-
-# Norm Clipping防御
-clip_threshold: 10.0  # 范数阈值
-
-# Weak DP防御
-dp_noise_scale: 0.001  # 高斯噪声标准差
-
-# ============= 可视化配置 =============
 visualization:
-  enabled: false  # 防御测试时通常关闭（节省时间）
-  save_interval: 10
-  save_dir: './defense_visualizations'
-
-# ============= 输出配置 =============
-environment_name: 'defense_test'
-save_model: false  # 防御测试时通常不保存模型
-save_on_epochs: [50]
-results_dir: './results/defense_test'
-
-# ============= 测试场景配置 =============
-# 可以定义多个测试场景
-
-scenarios:
-  # 场景1：标准测试（默认）
-  standard:
-    epochs: 50
-    num_adversaries: 3
-    bkd_ratio: 0.18
-  
-  # 场景2：强攻击
-  strong_attack:
-    epochs: 50
-    num_adversaries: 5
-    bkd_ratio: 0.30
-    initial_intensity: 0.15
-    final_intensity: 0.65
-  
-  # 场景3：隐蔽攻击
-  stealthy_attack:
-    epochs: 50
-    num_adversaries: 2
-    bkd_ratio: 0.10
-    initial_intensity: 0.08
-    final_intensity: 0.40
-  
-  # 场景4：快速测试
-  quick_test:
-    epochs: 20
-    num_adversaries: 2
-    bkd_ratio: 0.15
-
-# ============= 防御效果阈值 =============
-# 用于自动评估防御效果
-
-defense_effectiveness_thresholds:
-  # ASR下降阈值
-  excellent: 50  # ASR下降>50%: 优秀
-  good: 30       # ASR下降>30%: 良好
-  fair: 15       # ASR下降>15%: 一般
-  poor: 5        # ASR下降>5%:  较差
-  # <5%: 无效
-  
-  # 主任务准确率下降容忍度
-  max_accuracy_drop: 5  # 最多容忍5%的准确率下降
+  enabled: false
